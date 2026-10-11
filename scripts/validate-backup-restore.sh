@@ -102,7 +102,11 @@ echo "==> Step 4: Initializing fresh isolated PostgreSQL 16 cluster on port $iso
 cluster_dir="$temp_dir/cluster"
 mkdir -p "$cluster_dir/data" "$cluster_dir/run"
 chmod 700 "$cluster_dir/data" "$cluster_dir/run"
-chown -R postgres:postgres "$cluster_dir"
+# As root the cluster runs as postgres (see run_as_pg); otherwise, as on a CI
+# runner, it runs as the current user, who already owns these directories.
+if [[ $(id -u) -eq 0 ]]; then
+  chown -R postgres:postgres "$cluster_dir"
+fi
 
 run_as_pg /usr/lib/postgresql/16/bin/initdb -D "$cluster_dir/data" -A trust -U postgres --no-locale -E UTF8 >/dev/null
 
