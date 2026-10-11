@@ -44,7 +44,7 @@
     "build:tenant": "npm run build --workspace @skeleton/tenant",
     "test": "node --test tests/unit/**/*.test.mjs",
     "test:unit": "node --test tests/unit/**/*.test.mjs",
-    "test:integration": "node --test tests/integration/**/*.test.mjs",
+    "test:integration": "node --test --test-concurrency=1 tests/integration/**/*.test.mjs",
     "test:restore": "bash scripts/validate-backup-restore.sh",
     "test:smoke:tenant-edge": "node --test tests/smoke/**/*.test.mjs",
     "typecheck": "npm run typecheck:server-kit && npm run typecheck:backend && npm run typecheck:cloudflare && npm run typecheck:drizzle",
