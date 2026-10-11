@@ -37,8 +37,11 @@ jobs:
       TENANT_PGBOUNCER_AUTH_FILE: /tmp/skeleton-ci-pgbouncer-users.txt
       TENANT_PGBOUNCER_HOST: 127.0.0.1
       TENANT_PGBOUNCER_PORT: 6360
-      TENANT_PGBOUNCER_ADMIN_USER: pgbouncer_admin
+      TENANT_PGBOUNCER_ADMIN_USER: tenant_pgbouncer_admin
       TENANT_PGBOUNCER_ADMIN_PASSWORD: ci-pgbouncer-admin-password
+      # Fixture tenants log in through the CI PgBouncer, so the provisioner
+      # must reload it after adding each tenant login.
+      TENANT_PGBOUNCER_RELOAD_DISABLED: 'false'
       TENANT_POOL_DATABASE_URL: postgresql://tenant_pool_login:ci-pool-password@127.0.0.1:5432/platform_db
       STORAGE_ROOT: /tmp/skeleton-ci-storage
       INTEGRATION_SECRET_KEY: dGVzdC1vbmx5LWludGVncmF0aW9uLWtleS0zMmJ5dGU=
@@ -58,10 +61,33 @@ jobs:
       - run: npm run build
       - run: npm run typecheck
       - name: Install and start CI PgBouncer
+        # Generated here with the throwaway CI values above, so no fixture
+        # credentials are committed. Its auth file is the one the provisioner
+        # writes tenant logins into, as on a real installation.
         run: |
           sudo apt-get update && sudo apt-get install -y pgbouncer
-          chmod 600 tests/fixtures/pgbouncer/userlist.txt
-          pgbouncer -d tests/fixtures/pgbouncer/pgbouncer.ini
+          printf '"%s" "%s"\n' "$TENANT_PGBOUNCER_ADMIN_USER" "$TENANT_PGBOUNCER_ADMIN_PASSWORD" > "$TENANT_PGBOUNCER_AUTH_FILE"
+          chmod 600 "$TENANT_PGBOUNCER_AUTH_FILE"
+          cat > /tmp/skeleton-ci-pgbouncer.ini <<EOF
+          [databases]
+          platform_db = host=127.0.0.1 port=5432 dbname=platform_db
+
+          [pgbouncer]
+          listen_addr = 127.0.0.1
+          listen_port = $TENANT_PGBOUNCER_PORT
+          unix_socket_dir =
+          auth_type = scram-sha-256
+          auth_file = $TENANT_PGBOUNCER_AUTH_FILE
+          admin_users = $TENANT_PGBOUNCER_ADMIN_USER
+          pool_mode = transaction
+          max_client_conn = 100
+          default_pool_size = 5
+          max_db_connections = 20
+          ignore_startup_parameters = extra_float_digits
+          pidfile = /tmp/skeleton-ci-pgbouncer.pid
+          logfile = /tmp/skeleton-ci-pgbouncer.log
+          EOF
+          pgbouncer -d /tmp/skeleton-ci-pgbouncer.ini
       - run: bash scripts/ci-bootstrap-db.sh
       - name: Run unit tests
         run: |

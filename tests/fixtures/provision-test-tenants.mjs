@@ -18,7 +18,7 @@ for (const name of ['DATABASE_URL', 'DATABASE_ADMIN_URL', 'TENANT_PROVISIONER_DA
   if (!process.env[name]) throw new Error(`${name} is required.`)
 }
 process.env.TENANT_EDGE_VERIFY_DISABLED = 'true'
-process.env.TENANT_PGBOUNCER_RELOAD_DISABLED = 'true'
+process.env.TENANT_PGBOUNCER_RELOAD_DISABLED ||= 'true'
 const adminUrl = new URL(process.env.DATABASE_ADMIN_URL)
 process.env.TENANT_PGBOUNCER_HOST ||= adminUrl.hostname
 process.env.TENANT_PGBOUNCER_PORT ||= adminUrl.port || '5432'
