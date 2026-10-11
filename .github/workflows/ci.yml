@@ -10,6 +10,11 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # An explicit bash shell runs with -o pipefail, so a failing command
+        # piped through tee fails the step instead of reporting tee's status.
+        shell: bash
     services:
       postgres:
         image: postgres:16-alpine
