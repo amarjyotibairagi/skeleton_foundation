@@ -82,6 +82,26 @@ try {
   // processes cannot interleave migrations against the same cluster.
   await client.query('select pg_advisory_lock(hashtext($1))', ['platform-migrations'])
 
+  if (apply) {
+    // The ledger and its checksum columns are created by migrations 000 and
+    // 023. Left to them, the migrations before 023 were recorded without a
+    // checksum on a fresh install and stayed unprotected. Prepare the ledger
+    // first with the same idempotent statements, so those migrations no-op
+    // and every row is checksummed from the start.
+    await client.query(`
+      create schema if not exists platform;
+      create table if not exists platform.schema_migration (
+        migration_key text primary key,
+        migration_scope text not null check (migration_scope in ('platform', 'consumer', 'tenant', 'grants')),
+        applied_at timestamptz not null default now(),
+        applied_by text not null default session_user
+      );
+      alter table platform.schema_migration
+        add column if not exists source_file text,
+        add column if not exists checksum text;
+    `)
+  }
+
   const ledgerExists = await client.query(
     `select to_regclass('platform.schema_migration') is not null as present`,
   )
