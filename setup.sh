@@ -868,7 +868,7 @@ create_owner() {
 }
 
 run_demo() {
-  if [[ "$(psql_admin -d platform_db -Atc "select count(*) from consumer.user_account where email_normalized like '%@individual.io'")" == 0 ]]; then
+  if [[ "$(psql_admin -d platform_db -Atc "select count(*) from consumer.user_account where username = 'aarav.ganguly'")" == 0 ]]; then
     run "Adding 100 demo individual users" psql_admin -d platform_db -f "$INSTALL_DIR/database/seeds/001_seed_individuals.sql"
   else
     detail "Demo individual users already present"
