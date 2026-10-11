@@ -11,3 +11,6 @@ dist/
 .env/*.local
 runtime/
 backups/
+
+# Talk notes, kept local
+AI_TINKERERS_TALK.md
