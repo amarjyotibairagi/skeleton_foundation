@@ -120,5 +120,9 @@ jobs:
       - name: Verify all platform operator hashes are argon2id
         run: node scripts/platform-operator.mjs audit-hashes
       - run: npm run scan:secrets
-      - run: bash scripts/validate-backup-restore.sh
+      - name: Restore drill
+        run: bash scripts/validate-backup-restore.sh
+        env:
+          # The service container only accepts password logins over TCP.
+          PGPASSWORD: postgres
       - run: npm audit --audit-level=high
