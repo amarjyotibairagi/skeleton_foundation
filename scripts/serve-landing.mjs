@@ -65,6 +65,14 @@ export function createLandingServer(distRoot = defaultRoot) {
       } catch {
         file = resolve(distRoot, 'index.html')
       }
+      // Without a build there is nothing to serve: say so instead of sending 200
+      // headers and then dropping the connection when the read fails.
+      try {
+        if (!(await stat(file)).isFile()) throw new Error('not a file')
+      } catch {
+        response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '30' }).end('Landing page not built')
+        return
+      }
 
       response.writeHead(200, {
         'Content-Type': types[extname(file)] || 'application/octet-stream',

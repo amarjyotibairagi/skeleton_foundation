@@ -1,297 +1,215 @@
 # Platform Foundation
 
-A self-installing multi-tenant platform. Unzip this folder anywhere on an
-Ubuntu or Debian server, fill in `.env/`, and run `setup.sh`. The script
-builds a complete installation **inside this folder** and controls it from
-then on (status, backups, upgrades, uninstall). The admin panel then controls
-the platform itself.
+A ready-made base for multi-tenant SaaS products. Install it on one Linux
+server with a single script and you get:
 
-| Component | What it is |
+| Part | Where | What it gives you |
+|---|---|---|
+| **Operator console** | `platform.<your domain>` | Tenants, plans, configuration, operators, domains, server health, audit log, schema upgrades. Security-key sign-in |
+| **Tenant workspaces** | `<tenant>.<your domain>` | One per organisation, with its own isolated database schema: users and roles, departments and groups, files, audit trail, settings, a first-login setup wizard |
+| **Shared sign-in** | `app.<your domain>` | Users sign in with company, username and password, without knowing their tenant's address |
+| **Individual-user app** | `user.<your domain>` | Accounts for individuals (B2C), with plans |
+| **Landing page** | `<your domain>` | A generic public home page |
+| **Operations** | on the server | PostgreSQL with connection pools, a provisioning worker, encrypted daily backups, health checks, an optional Cloudflare Tunnel |
+
+The repository contains **no product features and no customer data**. You
+add your product as **modules**: tables, routes and screens that plug in
+without touching the security code, and that operators switch on per tenant
+or plan.
+
+| Document | Read it when |
 |---|---|
-| **Landing site** | A generic public home page on `ROOT_DOMAIN` |
-| **Platform console** | The operator admin panel on `platform.ROOT_DOMAIN`, for tenants, plans, configuration, operators, DNS, integrations and schema upgrades |
-| **Individual-user app** | The B2C app on `user.ROOT_DOMAIN` |
-| **Tenant workspaces** | One per organization, on `<name>.ROOT_DOMAIN`. Each has its own PostgreSQL schema with forced row-level security, its own database login (or a shared pool) and its own file storage. A tenant may optionally bring its own S3-compatible storage or PostgreSQL database |
-| **Provisioning worker** | Creates, migrates, relocates and removes tenants |
-| **PostgreSQL** | A dedicated cluster, plus three PgBouncer pools |
-| **Operations** | Encrypted daily backups, a health check every few minutes and an optional Cloudflare Tunnel |
-
-As shipped, the folder contains no secrets and no database. Every password and
-key is generated on the server during installation, and the database is
-created empty and then migrated.
-
-This repository is the **foundation only**. It contains no product modules
-and no customer data. Products are built on it as modules (section 0.6).
-
-**Contents**
-
-- [0. Orientation for developers and coding agents](#0-orientation-for-developers-and-coding-agents): how the code fits together, how to run it, and how to extend it
-- Sections 1–10: installing and operating a server with `setup.sh`
+| **This README** | You want to install, run or adapt the platform |
+| [`AGENTS.md`](AGENTS.md) | You (or a coding agent) are about to change the code |
+| [`stacks.md`](stacks.md) | You want to know which technologies are used, where and why |
+| [`docs/architecture/extending-the-foundation.md`](docs/architecture/extending-the-foundation.md) | You are building a module |
+| [`docs/operations/robustness-runbook.md`](docs/operations/robustness-runbook.md) | You operate an installation |
 
 ---
 
-## 0. Orientation for developers and coding agents
+## How to use
 
-Read this section before changing code. It gives you the map. The deeper
-references are [`docs/architecture/extending-the-foundation.md`](docs/architecture/extending-the-foundation.md)
-(the module contract and admin surface),
-[`docs/architecture/adr-001-tenancy-scaling-tiers.md`](docs/architecture/adr-001-tenancy-scaling-tiers.md)
-(isolation tiers and data placement), and
-[`docs/operations/robustness-runbook.md`](docs/operations/robustness-runbook.md).
+Pick the path that matches what you want to do.
 
-### 0.1 Five processes, four hostnames, one database
-
-```text
-Browser ──HTTPS──> edge (Cloudflare Tunnel or your proxy)
-   ROOT_DOMAIN, www      -> landing        :3651  static site (frontend/landing)
-   platform.ROOT_DOMAIN  -> platform BFF   :3656  backend/        + frontend/platform (operator console)
-   user.ROOT_DOMAIN      -> public BFF     :3657  backend/public  + frontend/public   (individual users, B2C)
-   *.ROOT_DOMAIN         -> tenant BFF     :6355  backend/tenant  + frontend/tenant   (one workspace per tenant)
-   app.ROOT_DOMAIN       -> tenant BFF     :6355  shared sign-in: company + username + password
-                            provisioner    (no port)  backend/provisioner: job worker for tenant lifecycle
-
-All BFFs ──> PgBouncer pools (platform :3658, public :3659, tenant :6360) ──> PostgreSQL :5433, database platform_db
-```
-
-- Every BFF serves its own frontend's built `dist/` and answers same-origin `/api/*`.
-  Browsers never talk to the database or to another service.
-- The **tenant BFF** resolves the tenant from the `Host` header
-  (`backend/tenant/src/tenant-context.ts`, `TenantResolver`). Only an exact
-  hostname registered as active in `platform.tenant_domain` is served.
-  `app.ROOT_DOMAIN` (`TENANT_APP_HOST`) is a shared host where the user names
-  the company at sign-in. The answer does not reveal whether a company or user
-  exists, and the company is then remembered in a signed cookie until sign-out.
-- The **provisioner** polls `platform.tenant_provisioning_job` and runs each job
-  as numbered, retryable steps. The job types are: create (about 20 steps,
-  ending in `CREATE_TENANT_OWNER` and `ACTIVATE_TENANT`), migrate (schema
-  upgrade), relocate data (`RELOC_*`), move files (`STORAGE_*`) and deprovision
-  (`DEPROV_*`). A failed job can be retried from the step that failed.
-
-### 0.2 Data model and isolation
-
-| Schema | Holds | Who reaches it |
-|---|---|---|
-| `platform` | Operators, sessions, audit, tenant registry and domains, provisioning jobs, plans, the configuration registry, integrations | Platform BFF through `SECURITY DEFINER` functions; the provisioner role |
-| `consumer` | B2C individuals, their subscriptions and groups | Public BFF (`consumer_bff_login`), with RLS |
-| `tenant_<key>` (one per tenant) | That tenant's users, roles, sessions, teams, settings, files metadata, audit, module tables | Only that tenant's database role, under **forced RLS** keyed on `app.tenant_id` |
-
-- Tenant requests run in one transaction with `SET LOCAL ROLE <tenant role>`,
-  `search_path = <schema>, pg_catalog` and `app.tenant_id` set
-  (`backend/tenant/src/tenant-database.ts`). Modules get this from
-  `kit.withTenant()` and must never open connections themselves.
-  `app.user_id` carries the signed-in user, for module RLS policies.
-- The tenant schema's privileges and RLS are **declared**, never hand-written:
-  every table is listed in `database/migrations/tenant/access-manifest.json`.
-  Migrations reset grants to exactly the manifest, and they fail if a table is
-  missing from it.
-- Tenants can use a pooled login (many small tenants, one PgBouncer user) or a
-  dedicated one. Their data can live on this server (the default), or in their
-  own PostgreSQL database or S3-compatible bucket ("bring your own", tested
-  before activation). See ADR-001.
-
-### 0.3 Security model (the parts you must not break)
-
-- **Sessions:** server-side sessions. Only a SHA-256 of the token is stored.
-  `__Host-` cookies, CSRF token on every mutation, and an `Origin` check.
-  Passwords are hashed with argon2id.
-- **Platform operators:** roles `platform_owner`, `platform_admin` and
-  `platform_viewer`.
-  - Every mutation, and reading live server telemetry, requires a WebAuthn
-    security-key check from the last 5 minutes (`backend/src/mfa.ts`). The
-    console runs the check on demand: `api.send` steps up automatically, and
-    read-only panels show a *Verify with security key* button.
-  - Writes go through database functions that keep invariants. For example,
-    at least one active owner always remains.
-- **Tenant users:** canonical roles `tenant_owner`, `tenant_admin`,
-  `tenant_manager`, `tenant_member` and `tenant_viewer`, mapped to permission
-  codes (`tenant.users.read`, `tenant.users.roles`, `tenant.settings.manage`,
-  …).
-  - Permissions are checked server-side with `kit.requirePermission`.
-  - A user whose password an administrator set or reset must change it first.
-    A server `preHandler` answers every other API call with 403
-    `PASSWORD_CHANGE_REQUIRED`.
-- **Sign-in:** Cloudflare Turnstile (`action: "login"`) on every sign-in page,
-  plus login throttling. `LOGIN_CHALLENGE=none` (servers) together with
-  `VITE_LOGIN_CHALLENGE=none` (build) disables Turnstile, for private
-  sandboxes only.
-- **Invitations:** 256-bit single-use tokens, stored hashed, carried in the
-  URL fragment.
-
-### 0.4 Repository map (where to look)
-
-| Path | What |
+| I want to… | Go to |
 |---|---|
-| `backend/src/server.ts` | Platform BFF: auth, sessions, operator MFA, Cloudflare DNS, system telemetry, tenant create/suspend/resume/remove |
-| `backend/src/admin-routes.ts` | Platform admin API: tenant detail and profile, plans, configuration values, operators, audit, fleet, consumers, integrations |
-| `backend/src/tenant-provisioning.ts` | Validation and creation of provisioning jobs (subdomain rules, owner bootstrap, modules, plan) |
-| `backend/provisioner/src/worker.ts` | The job worker; `tenant-migrations.ts` applies tenant schema versions; `tenant-operations.ts` relocation and upgrade helpers |
-| `backend/tenant/src/server.ts` | Tenant BFF: host resolution, app host, sign-in, sessions, users/roles/categories/default password/import, audit, module mounting, static serving |
-| `backend/tenant/src/modules/` | Tenant modules. **Core:** `invitations`, `settings`, `teams` (departments and groups), `files`, `integrations`. **Application:** `delegations` (the reference module, off by default). `types.ts` is the module contract |
-| `backend/public/src/server.ts` | Public (B2C) BFF |
-| `dependency/platform/ServerKit` | Shared server code: configuration resolution and validation, storage (local and S3), integrations, network policy, invitations, Turnstile, shared state |
-| `dependency/ui` | Shared React pieces: `useTurnstile` and `TurnstileSlot` (fixed-size sign-in widget), `MetricCard`, base styles |
-| `frontend/platform` | Operator console (React and Vite). `src/App.tsx` is the shell and hash router; `src/shell/nav.ts` holds the navigation and per-role access; `src/pages/*` are the dashboard, tenants, new tenant, tenant detail tabs, domains and server; `src/admin/*` are plans, configuration, operators, audit, fleet, individuals and security; `src/admin/ui.tsx` is the component kit |
-| `frontend/tenant` | Tenant workspace: sign-in (with company on the app host), forced password change, first-login setup wizard, welcome page, users (add, invite, CSV import, categories, default password, reset), departments and groups, files, audit, settings |
-| `frontend/public`, `frontend/landing` | B2C app; generic landing page |
-| `database/migrations/NNN_*.sql` + `manifest.json` | Platform migrations, applied in manifest order with checksums (`scripts/platform-migrate.mjs`) |
-| `database/migrations/tenant/versions/NNN_*.sql` | Tenant schema versions, applied to every tenant schema (`npm run migrate:tenants`; the provisioner applies them to new tenants) |
-| `setup.sh`, `deploy/templates/`, `scripts/foundation/` | Installer, rendered unit and config templates, Cloudflare and demo helpers |
-| `scripts/` | Migrations, tenant reconciliation, operator CLI (`platform-operator.mjs`), backup and restore drill, secret scan, test cluster |
-| `tests/unit`, `tests/integration`, `tests/fixtures`, `tests/helpers` | Test suites and the fixture tenants `alpha` and `beta` |
+| Run the platform on a server | [A. Install on a server](#a-install-on-a-server) |
+| Work on the code and run the tests | [B. Develop and test](#b-develop-and-test) |
+| Build my own product on it | [C. Make it your product](#c-make-it-your-product) |
 
-### 0.5 Working on the code
+### A. Install on a server
 
-Requirements: Node.js 22+ (CI uses 24), and the PostgreSQL 16 server
-binaries (`/usr/lib/postgresql/16/bin`, or set `PG_BIN`) for tests.
+You need:
+- **A server:** Ubuntu 22.04/24.04 or Debian 12, with root access, 2+ vCPUs,
+  4 GB+ RAM and 20 GB+ disk.
+- **A domain.** For the automatic setup, its DNS must be on Cloudflare.
+
+1. **Get the code** into the folder that will become the installation. Use
+   `/opt` or `/srv`, not `/root`.
+
+   ```bash
+   sudo git clone https://github.com/amarjyotibairagi/skeleton_foundation.git /opt/myplatform
+   cd /opt/myplatform
+   ```
+
+2. **Fill in five settings** in `.env/setup.env`:
+
+   | Setting | Example | Meaning |
+   |---|---|---|
+   | `PRODUCT_NAME` | `"Acme Cloud"` | Shown on every page |
+   | `APP_SLUG` | `acme` | Short name for system users and services |
+   | `ROOT_DOMAIN` | `acme.com` | Tenants get `<name>.acme.com` |
+   | `OWNER_USERNAME` | `owner` | The first operator account |
+   | `EDGE_MODE` | `cloudflare-api` | How the internet reaches the server ([details](#4-public-edge-modes)) |
+
+   With `EDGE_MODE=cloudflare-api`, also put `CLOUDFLARE_ACCOUNT_ID`,
+   `CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_API_TOKEN` in `.env/secrets.env`. The
+   token needs these permissions:
+   - *Account › Cloudflare Tunnel › Edit*
+   - *Account › Turnstile › Edit*
+   - *Zone › DNS › Edit*
+
+   Then protect the file:
+
+   ```bash
+   sudo chmod 600 .env/secrets.env
+   sudo git update-index --skip-worktree .env/secrets.env   # keep your credentials out of commits
+   ```
+
+3. **Check.** This validates the settings and the server and changes nothing:
+
+   ```bash
+   sudo ./setup.sh check
+   ```
+
+4. **Install.** It takes several minutes, and you can safely re-run it if it stops:
+
+   ```bash
+   sudo ./setup.sh install --install-packages    # add --with-demo for sample data
+   ```
+
+5. **Sign in.** Read the generated owner password, then open
+   `https://platform.<your domain>`:
+
+   ```bash
+   sudo cat runtime/config/secrets/initial-owner.txt
+   ```
+
+   Enrol a security key when asked, then delete that file. Create your first
+   tenant from *Tenants › New tenant*. You set its administrator's login there
+   too, so they can sign in at `https://<tenant>.<your domain>` as soon as it
+   is ready.
+
+Day to day:
 
 ```bash
-npm ci                     # one lockfile for all workspaces
-npm run build              # every workspace: backends to dist/, frontends to dist/
-npm run typecheck          # backends and shared packages
-npx tsc -b frontend/<app>  # one frontend (each has its own tsconfig)
+sudo ./setup.sh status            # services, database, tenants, backups, health
+sudo ./setup.sh backup            # encrypted backup now (a daily one runs automatically)
+sudo ./setup.sh logs tenant       # follow a service's log
+sudo git pull && sudo ./setup.sh install   # upgrade in place: data, secrets and tenants are kept
+```
 
-# The development loop: a throwaway PostgreSQL cluster with every migration
-# applied and two fixture tenants (alpha.sandbox.test, beta.sandbox.test)
-# provisioned through the real pipeline. Removed when the command exits.
-bash scripts/with-test-cluster.sh npm run test:unit
-bash scripts/with-test-cluster.sh                      # integration suite
+### B. Develop and test
+
+You need Node.js 22+ and the PostgreSQL 16 server binaries (the
+`postgresql-16` package). Nothing has to be installed with `setup.sh`.
+
+```bash
+git clone https://github.com/amarjyotibairagi/skeleton_foundation.git
+cd skeleton_foundation
+npm ci
+npx playwright install --with-deps chromium   # once: the browser for the UI tests
+npm run build
+./setup.sh test
+```
+
+`./setup.sh test` starts a throwaway PostgreSQL cluster and applies every
+migration. It provisions two test tenants through the real pipeline, runs the
+unit, integration and browser tests, and deletes everything afterwards.
+
+To run one test file:
+
+```bash
 bash scripts/with-test-cluster.sh node --test tests/integration/<file>.test.mjs
 ```
 
-- **Testing the BFFs.** Integration tests import the built servers
-  (`backend/*/dist/server.js`), call `createServer()` and drive them with
-  `app.inject()` against the real database. A new feature's test should
-  follow `tests/integration/admin-controls.test.mjs` or
-  `tests/integration/tenant-onboarding.test.mjs`. Both provision a tenant,
-  enable a feature, then assert the allowed and the denied paths.
-- **Testing the UIs in a browser.**
-  `tests/integration/platform-console.test.mjs` serves the built console
-  through the platform BFF and routes a Playwright browser's requests to
-  `app.inject()`. It needs no DNS, TLS or Turnstile. A seeded session row
-  stands in for sign-in. Reuse this pattern for UI work. Run `npm run build`
-  first: the test is skipped without `frontend/platform/dist`.
-- **Running the servers by hand.** The BFFs read their configuration from
-  environment variables. `with-test-cluster.sh` exports a complete test set,
-  so `bash scripts/with-test-cluster.sh npm run start:tenant:bff` runs a
-  server against the throwaway database. Real browser sign-in needs HTTPS on
-  real hostnames (`__Host-` cookies, WebAuthn). For that, install on a VM with
-  `setup.sh`; `EDGE_MODE=none` with a local reverse proxy and
-  `LOGIN_CHALLENGE=none` works for a sandbox.
-- **CI** (`.github/workflows/ci.yml`) runs on PostgreSQL 16 and PgBouncer. It
-  runs the build, typecheck, unit and integration tests, the migration ledger
-  and tenant registry checks, the secret scan and a restore drill. Tests that
-  are skipped fail the job.
+Before changing code, read [`AGENTS.md`](AGENTS.md): the rules, the map and
+step-by-step recipes.
 
-### 0.6 Building on the foundation (modules)
+### C. Make it your product
 
-A product feature is a **module**: tenant tables, routes, configuration keys
-and UI. It plugs in without touching the security code. The full checklist,
-with code, is in `docs/architecture/extending-the-foundation.md`. In short:
+1. **Start your own repository from this one.** Fork it on GitHub, or clone
+   it and push to a new remote. Keep this repository as `upstream` to pull
+   foundation updates later:
 
-1. **Configuration keys.** Add a platform migration (the next free number, appended to
-   `database/migrations/manifest.json`) that inserts `module.<code>` (a
-   feature, **off by default**) and any limits or settings into
-   `platform.config_definition`. Operators switch it on per platform, plan or
-   tenant. The *New tenant* form and the tenant's *Plan & modules* tab list
-   every `module.*` key automatically.
-2. **Tenant tables.** Add `database/migrations/tenant/versions/NNN_<name>.sql`.
-   - Use the **next contiguous** number: the runner refuses gaps. Plain SQL, no
-     `begin`/`commit`, `search_path` is the tenant schema.
-   - Seed the module's permissions into `permission` and `role_permission`.
-   - Declare every new table in `access-manifest.json`.
-   - To grant access to a department or group, reference `team(team_id)`.
-3. **Routes.** Export a `TenantModule` with a `featureKey` from
-   `backend/tenant/src/modules/<code>.ts` and add it to `applicationModules`
-   in `modules/index.ts`.
-   - Where the feature is off, every route answers 404.
-   - Use `kit.requireSession`, `kit.requirePermission`, `kit.requireCsrf` on
-     mutations, `kit.withTenant` for every query, `kit.config` for settings,
-     `kit.files` for files and `kit.audit` for state changes.
-   - Never take a schema, role or tenant identifier from the client.
-4. **UI.** Read `config['module.<code>']` from `/api/tenant/bootstrap` (only
-   keys marked `is_public` are present) to show the module in the tenant
-   workspace's navigation (`frontend/tenant/src/App.tsx`, the `nav` list).
-5. **Data moves.** When a tenant's data moves to another database, rows are
-   copied verbatim with `app.relocating = 'true'`, so module triggers should
-   skip derived writes while `current_setting('app.relocating', true) = 'true'`.
-6. **Minimum schema.** If the tenant BFF starts to depend on a new tenant
-   migration, raise `MIN_SUPPORTED_SCHEMA_VERSION` in
-   `backend/tenant/src/tenant-context.ts`. Older tenants then answer 503 until
-   they are upgraded (Console › Fleet & schema).
+   ```bash
+   git remote add upstream https://github.com/amarjyotibairagi/skeleton_foundation.git
+   git pull upstream main
+   ```
 
-The reference module is `backend/tenant/src/modules/delegations.ts`.
+2. **Brand it without code.** The product name, domain and landing-page text
+   are settings (`.env/setup.env`). Each tenant's colours, logo and sign-in
+   message are set in the console.
 
-### 0.7 Conventions
+3. **Add your features as modules.** A module is:
+   - a feature switch, off by default, that operators turn on per tenant or
+     plan;
+   - tenant tables, with their access declared in one manifest;
+   - API routes, given the session, permissions and the tenant's database
+     connection;
+   - screens in the tenant workspace.
 
-- **Applied migrations:** never edit one. Platform and tenant migrations are
-  checksummed. Write a new one instead (`npm run verify:migrations` catches
-  drift).
-- **Admin control:** everything an operator should control is a configuration
-  key or an admin API, never a constant per deployment. Branding, the product
-  name and domains come from configuration (`/api/public-config`, tenant
-  branding), not from code.
-- **Tests:** every new route gets an integration test covering the allowed and
-  the denied paths. The suite must pass with nothing skipped.
-- **Secrets:** never commit secrets or customer data. `.env/secrets.env` ships
-  blank; real values live in `runtime/` (ignored), and
-  `npm run scan:secrets` checks the built bundles.
+   Follow the recipe in [`AGENTS.md` §5](AGENTS.md#add-a-module); the
+   reference module is `backend/tenant/src/modules/delegations.ts`.
 
-### 0.8 What changed in the last sync (2026-10-19)
-
-The foundation picked up these changes from the production system they were
-developed on:
-
-- **Operator console redesign.**
-  - A grouped sidebar with per-role access, hash routes (back, refresh and
-    links work), light and dark themes, and phone layout.
-  - A dashboard built around *Needs attention*: failed tenants, pending
-    upgrades, resource pressure and recent denials.
-  - Per-tenant pages with tabs (overview, profile, plan and modules,
-    administrator access, storage and data, configuration, jobs).
-  - In-app confirmations, including typing the subdomain to remove a tenant.
-- **Tenant onboarding.**
-  - The first administrator's login can be set during provisioning (platform
-    migration 036, step `CREATE_TENANT_OWNER`); an emailed invitation remains
-    an option.
-  - Modules are chosen at creation.
-  - A removed tenant releases its subdomain for reuse (039).
-- **Tenant workspace.**
-  - A welcome page and a first-login setup wizard.
-  - Users with administrator and user kinds, user categories, CSV import, and
-    a workspace default password with administrator reset and a forced change
-    (tenant migrations 009–011).
-  - Departments and groups as a core module (012).
-  - The shared `app.` host with company sign-in.
-- **Operator self-service.** Operators change their own password (037);
-  telemetry reads require a security-key check.
-- **Hardening.**
-  - Lookup indexes (tenant migration 008) and capacity and security
-    hardening (033).
-  - Provisioning retry and audit fixes (035).
-  - Fastify client errors keep their 4xx status.
-  - Stricter static-file caching, and stale-chunk protection in the tenant
-    build.
-
-Known follow-up: file writes already take the shared side of the
-`skeleton-local-storage-backup` advisory lock, but
-`scripts/backup-platform-db.sh` does not yet hold the exclusive side while
-collecting. Backups taken during uploads can therefore include a file without
-its row, or the reverse.
+4. **Ship.** Push to your repository: CI builds and runs the full test suite.
+   On the server, `sudo git pull && sudo ./setup.sh install` applies the new code,
+   migrations and tenant schema upgrades.
 
 ---
 
+## Repository layout
+
+```
+.
+├── setup.sh              installer and day-to-day control (check, install, status, backup, test, …)
+├── .env/
+│   ├── setup.env         every installation decision (no secrets)
+│   └── secrets.env       credentials you supply (ships blank)
+├── backend/              platform, public and tenant servers (Fastify) and the provisioning worker
+├── frontend/             operator console, tenant workspace, individual-user app (React), landing page
+├── dependency/           shared packages: server kit, UI kit, Cloudflare and database clients
+├── database/
+│   ├── migrations/       platform migrations (ordered by manifest.json) and tenant schema versions
+│   └── seeds/            optional demo individuals
+├── deploy/templates/     systemd units, PgBouncer and PostgreSQL configuration templates
+├── scripts/              migrations, operator tools, backup and restore drill, test cluster, installer helpers
+├── tests/                unit, integration and browser tests (run against a throwaway database)
+├── docs/                 architecture and operations notes
+├── AGENTS.md             guide for coding agents and contributors
+└── stacks.md             technologies: what, where and why
+```
+
+---
+
+# Reference
+
+The rest of this file covers the installer in detail.
+
 ## 1. Requirements
 
-- A server running **Ubuntu 22.04/24.04 or Debian 12** with systemd, root access, 2 or more vCPUs, 4 GB or more RAM and 20 GB or more of disk.
-- A domain name. With the recommended Cloudflare mode, its DNS must be on Cloudflare.
-- Outbound internet access during installation (packages, npm, Cloudflare API).
+- **Server:** Ubuntu 22.04/24.04 or Debian 12 with systemd and root access;
+  2+ vCPUs, 4 GB+ RAM, 20 GB+ disk.
+- **Domain:** with `EDGE_MODE=cloudflare-api`, its DNS must be on Cloudflare.
+- **Internet access** during installation (packages, npm, the Cloudflare
+  API).
+- **Software:** PostgreSQL 16+, PgBouncer, Node.js 22+ and cloudflared. The
+  installer fetches them with `--install-packages`, or you can install them
+  beforehand.
 
-The installer can fetch PostgreSQL 16+, PgBouncer, Node.js 22+ and cloudflared
-itself (`--install-packages`), or you can install them beforehand.
+## 2. Folder layout of an installation
 
-## 2. Folder layout
-
-The installation lives entirely in the folder that holds `setup.sh`:
+Everything lives in the folder that holds `setup.sh`:
 
 | Path | Created by install | Contents |
 |---|---|---|
@@ -302,66 +220,19 @@ The installation lives entirely in the folder that holds `setup.sh`:
 | `./runtime/node/` | yes | Node.js, when `--install-packages` downloaded it |
 | `./backups/` | yes | Encrypted backups (`BACKUP_DIR` can point elsewhere) |
 
-Outside the folder, install adds only what a service needs:
+Outside the folder, install adds only:
 
-- systemd units `/etc/systemd/system/<slug>-*`
-- system users `<slug>-*`
-- the PostgreSQL, PgBouncer and cloudflared packages, from the OS repositories
+- systemd units `/etc/systemd/system/<slug>-*`;
+- system users `<slug>-*`;
+- PostgreSQL, PgBouncer and cloudflared, from the OS repositories.
 
 `sudo ./setup.sh uninstall --purge` removes all of that and returns the folder
-to exactly its unzipped state, keeping `./backups/`.
+to its original state, keeping `./backups/`. Every directory above the folder
+must be traversable by other users, so use `/opt` or `/srv`; `check` says so
+if a location cannot be used. To run two installations on one server, give
+the folders different `APP_SLUG`s and ports.
 
-Put the folder somewhere the service accounts can reach, such as
-`/opt/<name>` or `/srv/<name>`. Every directory above it must be traversable
-by other users, so `/root` does not work. `check` says so if a location
-cannot be used. To run two installations on one server, use two folders with
-different `APP_SLUG`s and ports.
-
-What ships in the folder:
-
-```
-foundation/
-├── setup.sh              ← the installer (run this)
-├── .env/
-│   ├── setup.env         ← every decision about the installation (no secrets)
-│   └── secrets.env       ← credentials you supply (blank by default)
-├── backend/              platform, public, tenant services and the provisioning worker
-├── frontend/             landing, platform console, individual app, tenant app
-├── dependency/           shared server kit, UI kit, Cloudflare and Drizzle packages
-├── database/
-│   ├── migrations/       platform migrations (ordered by manifest.json) and tenant schema versions
-│   └── seeds/            optional demo individuals
-├── deploy/templates/     systemd units, PgBouncer and PostgreSQL configuration templates
-├── scripts/              migration, operator, backup, health and foundation helper scripts
-├── tests/                unit and integration tests (run against a throwaway database)
-└── docs/                 architecture, security and operations notes
-```
-
-## 3. Quick start
-
-```bash
-# 1. Unpack into the folder that will become the installation
-sudo mkdir -p /opt/myplatform && cd /opt/myplatform
-sudo unzip /path/to/foundation-<date>.zip
-
-# 2. Make your decisions
-sudo nano .env/setup.env        # product name, domain, edge mode, ports...
-sudo nano .env/secrets.env      # Cloudflare token / Turnstile keys, as your choices require
-
-# 3. Validate. This changes nothing.
-sudo ./setup.sh check
-
-# 4. Install
-sudo ./setup.sh install --install-packages            # add --with-demo for sample data
-
-# 5. First sign-in
-sudo cat runtime/config/secrets/initial-owner.txt
-```
-
-Open `https://platform.<your domain>`, sign in as the owner and enrol a
-security key when asked. After that, delete `initial-owner.txt`.
-
-## 4. The `.env` folder
+## 3. The `.env` folder
 
 ### `.env/setup.env` (decisions, no secrets)
 
@@ -378,9 +249,11 @@ security key when asked. After that, delete `initial-owner.txt`.
 
 ### `.env/secrets.env` (credentials you already have)
 
-The file ships blank. If you keep this folder in git, never commit it after
-filling it in: keep your copy as `.env/secrets.env.local` (ignored) and copy it
-into place on the server.
+The file ships blank, and it must never be committed once filled in. In a git
+clone, run `git update-index --skip-worktree .env/secrets.env` after editing
+it, so git ignores your changes. Alternatively, keep your copy as
+`.env/secrets.env.local` (ignored) and copy it into place on the server.
+Either way, keep it `chmod 600`.
 
 | Key | Needed when |
 |---|---|
@@ -407,7 +280,7 @@ systemd reads them when it starts each service.
 `backup.key`, backups cannot be decrypted. Without `INTEGRATION_SECRET_KEY`,
 stored tenant integration credentials cannot be unsealed.
 
-## 5. Public edge modes
+## 4. Public edge modes
 
 **`cloudflare-api` (recommended, fully automatic).** The installer creates or
 updates the following:
@@ -445,7 +318,7 @@ user.example.com             { reverse_proxy 127.0.0.1:3657 }
 **`LOGIN_CHALLENGE=none`** removes the Turnstile widget from all sign-in pages.
 Throttling and rate limits still apply. Use it only for private sandboxes.
 
-## 6. Commands
+## 5. Commands
 
 ```
 sudo ./setup.sh check                 validate .env/ and the host, show the plan
@@ -499,8 +372,15 @@ contains passwords.
 
 ### Upgrading
 
-Copy the new code over the folder while keeping `.env/`, `runtime/` and
-`backups/`. For example, unzip the new package somewhere else, then run:
+From a git clone:
+
+```bash
+sudo git pull
+sudo ./setup.sh install
+```
+
+From a zip, copy the new code over the folder while keeping `.env/`,
+`runtime/` and `backups/`:
 
 ```bash
 sudo rsync -a --exclude .env --exclude runtime --exclude backups /tmp/new/ /opt/myplatform/
@@ -517,22 +397,34 @@ The upgrade:
 Secrets, data, tenants and tenant PgBouncer entries are preserved. You can
 also run tenant schema upgrades per tenant from the admin panel.
 
-## 7. After installation
+## 6. After installation
 
-- **Create tenants:** *Platform console › Tenants › New*. The worker runs about
-  20 steps: schema, role, grants, storage, domain and verification. The
-  owner receives a one-time invitation link.
-- **Configuration:** *Platform console › Configuration* controls features,
+- **Create tenants:** *Console › Tenants › New tenant*.
+  - **Administrator:** create their login on the spot, email them an
+    invitation link, or invite them later from the tenant's page.
+  - **Modules and plan:** choose them in the same form.
+  - **Provisioning:** the worker runs about 20 steps (schema, role, grants,
+    storage, domain, administrator, verification), shown live.
+- **Manage a tenant:** open it in *Console › Tenants*. Its tabs cover
+  overview and schema upgrade, profile and branding, plan and modules,
+  administrator access, storage and data, configuration overrides, and job
+  history. Suspend, resume and remove are there too; removing needs the
+  subdomain typed and releases it for reuse.
+- **Configuration:** *Console › Configuration* controls features,
   limits, branding, tiers and integrations. Settings apply at the platform,
   plan or tenant level.
 - **Bring-your-own storage or database:** tenants (or operators) add an
   S3-compatible bucket or an external PostgreSQL, run **Test** and then
   **Activate**. The worker relocates the data. By default everything stays
   on this server.
-- **Operators:** invite additional operators from the console. Security-key
-  step-up protects sensitive actions.
+- **Operators:** invite more operators from *Console › Operators* (owners
+  only). Changes, and reading live server data, require a recent
+  security-key check; the console asks for one when needed.
+- **Tenant users:** a tenant's administrator manages users, categories,
+  departments and groups, and a workspace default password from the tenant
+  workspace. A first-login wizard walks a new administrator through it.
 
-## 8. Backups and restore
+## 7. Backups and restore
 
 `<slug>-backup.timer` runs `scripts/backup-platform-db.sh` on
 `BACKUP_SCHEDULE`. Each backup is a single AES-256 encrypted archive,
@@ -556,7 +448,12 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in platform-backup-<ts>.tar.gz
 cluster and verifies the tenant schemas and isolation. Run it regularly. See
 `docs/operations/robustness-runbook.md` for the full recovery procedure.
 
-## 9. Troubleshooting
+Known gap: a backup taken while files are being uploaded can contain a file
+without its database row, or the reverse. File writes already take the
+shared side of a database lock (`skeleton-local-storage-backup`); the backup
+script does not yet hold the exclusive side.
+
+## 8. Troubleshooting
 
 | Symptom | Check |
 |---|---|
@@ -571,20 +468,22 @@ cluster and verifies the tenant schemas and isolation. Run it regularly. See
 | Start over from scratch | `sudo ./setup.sh uninstall --purge`, then `install` again. |
 | Anything else | Re-run with `--debug`, and read the `runtime/logs/setup-*.log` of the failed run. |
 
-## 10. Development and tests
+## 9. Tests and packaging
 
 ```bash
-./setup.sh test         # needs Node.js 22+ and PostgreSQL server binaries;
-                        # runs npm ci and the backend build first if needed
-./setup.sh package      # clean zip for distribution (see below)
+./setup.sh test         # Node.js 22+ and PostgreSQL server binaries; no root and no installation needed.
+                        # Installs dependencies and builds the backends and console if they are missing.
+./setup.sh package      # a clean zip for distribution (see below)
 ```
 
 The test harness (`scripts/with-test-cluster.sh`) creates a temporary cluster,
 applies the migrations and provisions two fixture tenants (`alpha` and `beta`
-on `sandbox.test`) through the real pipeline. It then runs the unit and
-integration suites and removes everything afterwards.
+on `sandbox.test`) through the real pipeline. It then runs the unit,
+integration and browser suites and removes everything afterwards. CI
+(`.github/workflows/ci.yml`) runs the same suites through a real PgBouncer and
+fails if any test is skipped.
 
-### Packaging
+### Packaging a release
 
 `./setup.sh package` writes `../<folder>-<timestamp>.zip`, which contains
 exactly what a new installation needs. It leaves out `runtime/`, `backups/`,

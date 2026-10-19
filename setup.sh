@@ -459,7 +459,7 @@ deploy_code() {
   # Code runs in place. Service accounts need to read it but never write it,
   # and nobody but root may read the .env folder.
   local item
-  for item in backend database dependency deploy docs frontend scripts tests package.json package-lock.json setup.sh README.md; do
+  for item in backend database dependency deploy docs frontend scripts tests package.json package-lock.json setup.sh README.md AGENTS.md stacks.md LICENSE; do
     [[ -e "$SOURCE_DIR/$item" ]] && chmod -R go-w,o+rX "$SOURCE_DIR/$item"
   done
   chmod go-w,o+x "$SOURCE_DIR"
@@ -1161,6 +1161,13 @@ cmd_test() {
   fi
   if [[ ! -f backend/dist/server.js ]]; then
     run "Building shared packages and backends" bash -c 'npm run build:server-kit && npm run build:cloudflare && npm run build:drizzle && npm run build:backend'
+  fi
+  # Tests serve the built console and landing page; without a build the console test is skipped.
+  if [[ ! -f frontend/platform/dist/index.html ]]; then
+    run "Building the platform console" npm run build:platform
+  fi
+  if [[ ! -f frontend/landing/dist/index.html ]]; then
+    run "Building the landing page" npm run build:landing
   fi
   info "Running the test suite against a throwaway PostgreSQL cluster (nothing installed is touched)"
   PG_BIN="$pg" bash scripts/with-test-cluster.sh node --test --test-concurrency=1 'tests/unit/**/*.test.mjs' 'tests/integration/**/*.test.mjs'
