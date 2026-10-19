@@ -72,7 +72,14 @@ describe('Integration: platform console in a browser', { skip: !staticReady && '
     fs.rmSync(tempDir, { recursive: true, force: true })
   })
 
+  // The BFF rate-limits per client address. Each browser session (and each
+  // direct API setup call) gets its own, so earlier scenarios cannot use up the
+  // quota of later ones on a slow runner.
+  let clientNumber = 0
+  const nextClient = () => `127.0.10.${++clientNumber}`
+
   async function openBrowser(token, viewport) {
+    const remoteAddress = nextClient()
     const browser = await chromium.launch({ headless: true })
     const context = await browser.newContext({ viewport })
     await context.addCookies([{ name: '__Host-platform_session', value: token, domain: HOST, path: '/', secure: true, httpOnly: true, sameSite: 'Strict' }])
@@ -90,6 +97,7 @@ describe('Integration: platform console in a browser', { skip: !staticReady && '
       const url = new URL(request.url())
       const response = await platform.inject({
         method: request.method(),
+        remoteAddress,
         url: url.pathname + url.search,
         headers: { ...request.headers(), host: HOST },
         ...(request.postDataBuffer() ? { payload: request.postDataBuffer() } : {}),
@@ -282,6 +290,7 @@ describe('Integration: platform console in a browser', { skip: !staticReady && '
     await pool.query('update platform.platform_session set csrf_hash = $1 where token_hash = $2', [sha256(csrf), sha256(ownerToken)])
     const username = `zzviewer${crypto.randomBytes(3).toString('hex')}`
     const invited = await platform.inject({
+      remoteAddress: nextClient(),
       method: 'POST',
       url: '/api/platform/users',
       headers: { cookie: `__Host-platform_session=${ownerToken}`, 'x-csrf-token': csrf, origin: `https://${HOST}`, 'content-type': 'application/json' },
@@ -290,6 +299,7 @@ describe('Integration: platform console in a browser', { skip: !staticReady && '
     assert.equal(invited.statusCode, 201, invited.payload)
     const link = JSON.parse(invited.payload).invitation.link
     const accepted = await platform.inject({
+      remoteAddress: nextClient(),
       method: 'POST',
       url: '/api/auth/invitations/accept',
       headers: { origin: `https://${HOST}`, 'content-type': 'application/json' },
