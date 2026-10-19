@@ -98,8 +98,10 @@ jobs:
       - run: bash scripts/ci-bootstrap-db.sh
       - name: Run unit tests
         run: |
-          OUTPUT=$(npm run test:unit 2>&1 | tee /tmp/unit-test.log)
-          if echo "$OUTPUT" | grep -q 'ℹ skipped [1-9]'; then
+          # Stream the output to the job log (pipefail fails the step on a test
+          # failure), then reject any skipped test.
+          npm run test:unit 2>&1 | tee /tmp/unit-test.log
+          if grep -q 'ℹ skipped [1-9]' /tmp/unit-test.log; then
             echo "Error: Skipped unit tests detected!"
             exit 1
           fi
@@ -107,8 +109,10 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Run integration tests
         run: |
-          OUTPUT=$(npm run test:integration 2>&1 | tee /tmp/integration-test.log)
-          if echo "$OUTPUT" | grep -q 'ℹ skipped [1-9]'; then
+          # Stream the output to the job log (pipefail fails the step on a test
+          # failure), then reject any skipped test.
+          npm run test:integration 2>&1 | tee /tmp/integration-test.log
+          if grep -q 'ℹ skipped [1-9]' /tmp/integration-test.log; then
             echo "Error: Skipped integration tests detected!"
             exit 1
           fi
