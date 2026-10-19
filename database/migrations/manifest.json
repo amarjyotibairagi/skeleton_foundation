@@ -150,6 +150,31 @@
       "file": "031_consumer_admin_and_public_surface.sql",
       "key": "031_consumer_admin_and_public_surface:v1",
       "scope": "platform"
+    },
+    {
+      "file": "033_capacity_and_security_hardening.sql",
+      "key": "033_capacity_and_security_hardening:v1",
+      "scope": "platform"
+    },
+    {
+      "file": "035_provisioning_retry_uuid_audit.sql",
+      "key": "035_provisioning_retry_uuid_audit:v1",
+      "scope": "platform"
+    },
+    {
+      "file": "036_tenant_owner_bootstrap.sql",
+      "key": "036_tenant_owner_bootstrap:v1",
+      "scope": "platform"
+    },
+    {
+      "file": "037_platform_operator_password_change.sql",
+      "key": "037_platform_operator_password_change:v1",
+      "scope": "platform"
+    },
+    {
+      "file": "039_release_removed_tenant_subdomains.sql",
+      "key": "039_release_removed_tenant_subdomains:v1",
+      "scope": "platform"
     }
   ]
 }

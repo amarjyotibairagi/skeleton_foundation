@@ -48,15 +48,32 @@ function inV4Range(address: string, base: string, bits: number): boolean {
 export function isPrivateAddress(address: string): boolean {
   if (net.isIPv4(address)) return blockedV4.some(([base, bits]) => inV4Range(address, base, bits))
   if (!net.isIPv6(address)) return true
-  const lower = address.toLowerCase()
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower)
-  if (mapped?.[1]) return isPrivateAddress(mapped[1])
-  if (lower === '::' || lower === '::1') return true
-  const first = parseInt(lower.split(':')[0] || '0', 16)
-  if ((first & 0xfe00) === 0xfc00) return true // fc00::/7 unique local
-  if ((first & 0xffc0) === 0xfe80) return true // fe80::/10 link local
-  if ((first & 0xff00) === 0xff00) return true // multicast
-  if (lower.startsWith('64:ff9b:') || lower.startsWith('2001:db8:')) return true
+  // Compare address bytes, not spelling: mapped IPv4 and compressed/expanded
+  // IPv6 forms must have identical policy decisions. Zone IDs are local scope.
+  if (address.includes('%')) return true
+  let normalized = address.toLowerCase()
+  normalized = normalized.replace(/(\d+\.\d+\.\d+\.\d+)$/, (tail) => {
+    const octets = tail.split('.').map(Number)
+    return `${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`
+  })
+  const halves = normalized.split('::')
+  const left = halves[0] ? halves[0].split(':') : []
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : []
+  const parts = halves.length === 2 ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left
+  if (parts.length !== 8) return true
+  const words = parts.map((part) => Number.parseInt(part, 16))
+  if (words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff) {
+    const v4 = `${words[6]! >>> 8}.${words[6]! & 255}.${words[7]! >>> 8}.${words[7]! & 255}`
+    return isPrivateAddress(v4)
+  }
+  // Only ordinary global unicast is accepted. Deny special-purpose,
+  // documentation and transition ranges (including embedded private IPv4).
+  const first = words[0]!
+  const second = words[1]!
+  if ((first & 0xe000) !== 0x2000) return true
+  if (first === 0x2002) return true // 6to4
+  if (first === 0x2001 && (second < 0x0200 || second === 0x0db8)) return true
+  if (first === 0x3fff && (second & 0xf000) === 0) return true // documentation /20
   return false
 }
 

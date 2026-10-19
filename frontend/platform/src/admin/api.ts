@@ -38,10 +38,25 @@ export function createAdminApi(csrfToken: string | null, onUnauthorized: () => v
     return data
   }
 
+  const verifyExistingKey = async () => {
+    const started = await raw('POST', '/api/auth/mfa/assertion/options')
+    const response = await getAssertion(started.options)
+    await raw('POST', '/api/auth/mfa/assertion/verify', { challengeId: started.challengeId, response })
+  }
+
   const registerSecurityKey = async () => {
-    const { challengeId, options } = await raw('POST', '/api/auth/mfa/registration/options')
-    const response = await createCredential(options)
-    await raw('POST', '/api/auth/mfa/registration/verify', { challengeId, response })
+    let started
+    try {
+      started = await raw('POST', '/api/auth/mfa/registration/options')
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== 'MFA_STEP_UP_REQUIRED') throw error
+      // Adding a key requires the existing factor, then a fresh enrollment
+      // challenge. First-key reauthentication has its own non-retry error.
+      await verifyExistingKey()
+      started = await raw('POST', '/api/auth/mfa/registration/options')
+    }
+    const response = await createCredential(started.options)
+    await raw('POST', '/api/auth/mfa/registration/verify', { challengeId: started.challengeId, response })
   }
 
   const stepUp = async () => {

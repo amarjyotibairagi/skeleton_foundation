@@ -97,6 +97,7 @@ const stepDefinitions = [
   ['APPLY_TENANT_SCHEMA_MIGRATIONS', 'Tenant structure applied'],
   ['APPLY_REQUIRED_SEED_DATA', 'Default tenant roles and permissions applied'],
   ['APPLY_SCHEMA_PRIVILEGES', 'Tenant isolation privileges applied'],
+  ['CREATE_TENANT_OWNER', 'Default tenant administrator created'],
   ['CONFIGURE_ROLE_SEARCH_PATH', 'Tenant database defaults configured'],
   ['REGISTER_DATABASE_ACCESS', 'Tenant pooled database access registered'],
   ['REGISTER_TENANT_DOMAIN', 'Tenant hostname registered'],
@@ -513,7 +514,7 @@ export class TenantProvisioningWorker {
         const result = await client.query<{ count: number }>(
           `select count(*)::int as count
              from platform.tenant_domain
-            where lower(hostname) = lower($1) and tenant_id <> $2`,
+            where lower(hostname) = lower($1) and tenant_id <> $2 and status <> 'released'`,
           [tenant.hostname, tenant.tenantId],
         )
         if (result.rows[0]?.count !== 0) throw new Error('Tenant hostname is no longer available.')
@@ -606,6 +607,54 @@ export class TenantProvisioningWorker {
           runtimeRole: tenant.dbRole,
           loginRole: tenant.loginRole,
         })
+      })
+      return
+    }
+    if (step === 'CREATE_TENANT_OWNER') {
+      // Optional: the operator set a default administrator login at
+      // onboarding. The account, owner role, credential and the bootstrap's
+      // consumption commit together, so a retry either finds it done or redoes it.
+      await this.withProvisioner(async (client) => {
+        const bootstrap = (
+          await client.query<{ username: string; display_name: string; email_normalized: string | null; password_hash: string }>(
+            `select username, display_name, email_normalized, password_hash
+               from platform.tenant_owner_bootstrap
+              where tenant_id = $1 and applied_at is null
+              for update`,
+            [tenant.tenantId],
+          )
+        ).rows[0]
+        if (!bootstrap) return
+        await client.query('set local role tenant_template_owner')
+        await client.query(`set local search_path = ${quoteIdentifier(tenant.schemaName)}, pg_catalog`)
+        await client.query(`select set_config('app.tenant_id', $1, true)`, [tenant.tenantId])
+        const ownerRole = (
+          await client.query<{ role_id: string }>(`select role_id::text from role_definition where role_code = 'tenant_owner'`)
+        ).rows[0]
+        if (!ownerRole) throw new Error('Role tenant_owner is missing.')
+        const user = (
+          await client.query<{ user_id: string }>(
+            `insert into user_account (username, display_name, email_normalized, account_status)
+             values ($1, $2, $3, 'active') returning user_id::text`,
+            [bootstrap.username, bootstrap.display_name, bootstrap.email_normalized],
+          )
+        ).rows[0]!
+        await client.query('insert into role_assignment (user_id, role_id, granted_by) values ($1, $2, null)', [user.user_id, ownerRole.role_id])
+        await client.query(
+          `insert into user_identity (user_id, provider, provider_subject, credential_type, password_hash)
+           values ($1, 'local', $2, 'password', $3)`,
+          [user.user_id, bootstrap.username, bootstrap.password_hash],
+        )
+        await client.query(
+          `insert into audit_event (actor_user_id, action, resource_type, resource_id, outcome, correlation_id, actor_type, reason)
+           values (null, 'owner:account_provisioned', 'user_account', $1, 'success', $2, 'operator', 'Default administrator set at onboarding')`,
+          [user.user_id, tenant.correlationId],
+        )
+        await client.query('set local role tenant_provisioner')
+        await client.query(
+          `update platform.tenant_owner_bootstrap set applied_at = now(), password_hash = null where tenant_id = $1`,
+          [tenant.tenantId],
+        )
       })
       return
     }
@@ -973,6 +1022,8 @@ export class TenantProvisioningWorker {
             where tenant_id = $1`,
           [tenant.tenantId],
         )
+        // The subdomain becomes available to a new tenant (migration 039).
+        await client.query(`update platform.tenant_domain set status = 'released' where tenant_id = $1`, [tenant.tenantId])
         await client.query(
           `update platform.tenant_integration set status = 'retired', retired_at = now()
             where tenant_id = $1 and status <> 'retired'`,
@@ -1259,7 +1310,17 @@ export class TenantProvisioningWorker {
   async tick(): Promise<boolean> {
     if (this.running) return false
     this.running = true
+    let recoveryGate: PoolClient | undefined
+    let gateHeld = false
     try {
+      recoveryGate = await this.pool.connect()
+      gateHeld = (await recoveryGate.query<{ acquired: boolean }>(
+        'select pg_try_advisory_lock_shared(hashtext($1)) as acquired',
+        ['skeleton-local-storage-backup'],
+      )).rows[0]?.acquired === true
+      // Leave jobs unclaimed while recovery inputs are collected, so a long
+      // backup cannot expire a job lease or split role/schema/file changes.
+      if (!gateHeld) return false
       const tenant = await this.acquireJob()
       if (!tenant) return false
       try {
@@ -1276,6 +1337,14 @@ export class TenantProvisioningWorker {
       }
       return true
     } finally {
+      if (recoveryGate) {
+        let destroy = false
+        if (gateHeld) {
+          try { await recoveryGate.query('select pg_advisory_unlock_shared(hashtext($1))', ['skeleton-local-storage-backup']) }
+          catch { destroy = true }
+        }
+        recoveryGate.release(destroy)
+      }
       this.running = false
     }
   }

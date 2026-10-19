@@ -84,6 +84,27 @@ export async function getUserWebAuthnCredentials(
   }))
 }
 
+export class MfaEnrollmentError extends Error {
+  readonly statusCode = 403
+  constructor(message: string, readonly code = 'MFA_STEP_UP_REQUIRED') { super(message) }
+}
+
+async function assertEnrollmentAllowed(pool: Pool | PoolClient, userId: string, sessionId: string): Promise<void> {
+  const session = (await pool.query<{ created_at: Date; mfa_verified_at: Date | null }>(
+    `select s.created_at, s.mfa_verified_at
+       from platform.platform_session s join platform.platform_user u on u.id = s.user_id
+      where s.id = $1 and s.user_id = $2 and s.expires_at > now() and u.is_active`,
+    [sessionId, userId],
+  )).rows[0]
+  if (!session) throw new MfaEnrollmentError('A valid signed-in session is required to register a security key.')
+  const enrolled = await getUserWebAuthnCredentials(pool, userId)
+  if (enrolled.length > 0) {
+    if (!isMfaRecent(session.mfa_verified_at)) throw new MfaEnrollmentError('Verify an existing security key before adding another key.')
+  } else if (!isMfaRecent(session.created_at)) {
+    throw new MfaEnrollmentError('Sign in again before registering your first security key.', 'MFA_REAUTH_REQUIRED')
+  }
+}
+
 export async function generateRegistrationChallenge(
   pool: Pool,
   userId: string,
@@ -91,6 +112,7 @@ export async function generateRegistrationChallenge(
   sessionId: string,
   config = getWebAuthnConfig(),
 ) {
+  await assertEnrollmentAllowed(pool, userId, sessionId)
   const existingCredentials = await getUserWebAuthnCredentials(pool, userId)
   const options = await generateRegistrationOptions({
     rpName: config.rpName,
@@ -139,6 +161,10 @@ export async function verifyRegistrationAssertion(
   const client = await pool.connect()
   try {
     await client.query('begin')
+    // Serialize enrollments for this user and recheck at consumption time;
+    // two first-key ceremonies must not become a second-key bypass.
+    await client.query('select pg_advisory_xact_lock(hashtext($1))', [`platform-mfa-enrollment:${userId}`])
+    await assertEnrollmentAllowed(client, userId, sessionId)
     const challengeRow = (
       await client.query<{
         challenge: string
@@ -149,11 +175,12 @@ export async function verifyRegistrationAssertion(
            from platform.platform_webauthn_challenge
           where challenge_id = $1
             and user_id = $2
+            and session_id = $3
             and purpose = 'registration'
             and consumed_at is null
             and expires_at > now()
           for update`,
-        [challengeId, userId],
+        [challengeId, userId, sessionId],
       )
     ).rows[0]
 
@@ -185,17 +212,11 @@ export async function verifyRegistrationAssertion(
     const publicKeyBuffer = Buffer.from(credential.publicKey)
 
     // Store new credential
-    await client.query(
+    const inserted = await client.query(
       `insert into platform.platform_webauthn_credential
          (credential_id, user_id, public_key, counter, transports, aaguid, is_enabled)
        values ($1, $2, $3, $4, $5, $6, true)
-       on conflict (credential_id) do update set
-         user_id = excluded.user_id,
-         public_key = excluded.public_key,
-         counter = excluded.counter,
-         transports = excluded.transports,
-         aaguid = excluded.aaguid,
-         is_enabled = true`,
+       on conflict (credential_id) do nothing`,
       [
         credential.id,
         userId,
@@ -205,6 +226,10 @@ export async function verifyRegistrationAssertion(
         aaguid || null,
       ],
     )
+    if (inserted.rowCount !== 1) {
+      await client.query('rollback')
+      return { verified: false, error: 'This credential is already registered.' }
+    }
 
     // Mark challenge as consumed
     await client.query(
@@ -303,10 +328,12 @@ export async function verifyAuthenticationAssertion(
            from platform.platform_webauthn_challenge
           where challenge_id = $1
             and user_id = $2
+            and session_id = $3
+            and purpose in ('authentication', 'step_up')
             and consumed_at is null
             and expires_at > now()
           for update`,
-        [challengeId, userId],
+        [challengeId, userId, sessionId],
       )
     ).rows[0]
 

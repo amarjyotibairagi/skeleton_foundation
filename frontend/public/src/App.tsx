@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { MetricCard } from '@skeleton/ui/MetricCard'
+import { TurnstileSlot } from '@skeleton/ui/TurnstileSlot'
 import { useTurnstile } from '@skeleton/ui/useTurnstile'
 import {
   ArrowRight,
@@ -100,10 +101,11 @@ export default function App() {
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
-  const { isVerified, turnstileToken, isCollapsed, isBadgeVisible, turnstileContainerRef, resetTurnstile } = useTurnstile({
+  const turnstile = useTurnstile({
     enabled: !checkingSession && !currentUser,
     onError: setErrorMsg,
   })
+  const { isVerified, turnstileToken, resetTurnstile } = turnstile
 
   // Workspace UI state
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -416,8 +418,9 @@ export default function App() {
             <p style={styles.subtitle}>Sign in with your individual creator credentials</p>
           </div>
 
+          {/* Floats below the card so a message never changes the card's size. */}
           {errorMsg && (
-            <div style={styles.errorBanner}>
+            <div role="alert" style={styles.errorBanner}>
               <span>{errorMsg}</span>
             </div>
           )}
@@ -463,20 +466,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className={`turnstile-grid-wrapper ${isCollapsed ? 'collapsed' : ''}`}>
-              <div className="turnstile-grid-inner">
-                <div ref={turnstileContainerRef} style={styles.turnstileMount} />
-              </div>
-            </div>
-
-            <div className={`verified-badge-wrapper ${isBadgeVisible ? 'visible' : ''}`}>
-              <div className="verified-badge-inner">
-                <div style={styles.verifiedPill}>
-                  <CheckCircle2 size={15} color="#059669" />
-                  <span>Security verification passed</span>
-                </div>
-              </div>
-            </div>
+            <TurnstileSlot turnstile={turnstile} />
 
             <button
               type="submit"
@@ -1323,6 +1313,7 @@ export default function App() {
 const styles: Record<string, React.CSSProperties> = {
   loginCard: {
     width: '100%',
+    position: 'relative',
     maxWidth: '430px',
     backgroundColor: '#fafbfc',
     borderRadius: '24px',
@@ -1332,7 +1323,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: '20px',
-    transition: 'padding 0.5s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s ease',
+    transition: 'box-shadow 0.3s ease',
   },
   header: {
     display: 'flex',
@@ -1372,13 +1363,21 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: '0.06em',
     borderRadius: '9999px',
     padding: '2px 9px',
+    lineHeight: '16px',
   },
   subtitle: {
     fontSize: '13px',
     color: '#64748b',
     marginTop: '2px',
+    lineHeight: '18px',
   },
   errorBanner: {
+    position: 'absolute',
+    top: 'calc(100% + 12px)',
+    left: 0,
+    right: 0,
+    zIndex: 5,
+    boxShadow: '0 12px 28px -10px rgba(0, 0, 0, 0.45)',
     backgroundColor: '#fef2f2',
     border: '1px solid #fecaca',
     color: '#dc2626',
@@ -1404,6 +1403,7 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#334155',
     letterSpacing: '0.01em',
     paddingLeft: '2px',
+    lineHeight: '16px',
   },
   inputWrapper: {
     position: 'relative',
@@ -1442,24 +1442,5 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: '8px',
-  },
-  turnstileMount: {
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    width: '100%',
-  },
-  verifiedPill: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: '6px',
-    backgroundColor: '#ecfdf5',
-    border: '1px solid #a7f3d0',
-    color: '#065f46',
-    fontSize: '12.5px',
-    fontWeight: 500,
-    padding: '9px 14px',
-    borderRadius: '14px',
   },
 }

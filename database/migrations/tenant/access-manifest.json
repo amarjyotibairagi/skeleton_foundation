@@ -18,6 +18,9 @@
     "audit_event": {"rls": true, "runtime": ["select", "insert"]},
     "capability_delegation": {"rls": true, "runtime": ["select", "insert", "update"]},
     "user_session": {"rls": true, "tenantColumn": "tenant_id", "login": ["select", "insert", "update", "delete"]},
-    "stored_object": {"rls": true, "runtime": ["select", "insert", "update", "delete"]}
+    "stored_object": {"rls": true, "runtime": ["select", "insert", "update", "delete"]},
+    "user_category": {"rls": true, "runtime": ["select", "insert", "update", "delete"]},
+    "user_category_member": {"rls": true, "runtime": ["select", "insert", "update", "delete"]},
+    "workspace_default_password": {"rls": true, "runtime": ["select", "insert", "update", "delete"]}
   }
 }

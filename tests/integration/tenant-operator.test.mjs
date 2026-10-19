@@ -289,7 +289,7 @@ describe('Integration: Tenant Operator CLI & Role Invariants', () => {
       assert.equal(rejectedCount, 1, 'The other concurrent demotion must be rejected')
 
       const rejectedError = resA.status === 'rejected' ? resA.reason : resB.reason
-      assert.match(rejectedError.message, /must retain at least one active tenant_owner/)
+      assert.match(rejectedError.message, /must keep at least one active Owner/)
 
       // Verify at least one active owner remains in the database
       const remaining = await adminPool.query(

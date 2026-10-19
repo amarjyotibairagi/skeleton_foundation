@@ -1,6 +1,7 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import type { AdminApi } from './api'
-import { Badge, Card, formatDate, Notice, PageHeader, useAsyncAction } from './ui'
+import { useState, type FormEvent } from 'react'
+import { Search, User, X } from 'lucide-react'
+import { useConsole } from '../shell/context'
+import { Badge, Card, EmptyState, Notice, PageHeader, Stat, StatusBadge, Table, formatDate, formatRelative, useAsyncAction, useConfirm, useResource } from './ui'
 
 type Consumer = {
   userId: string
@@ -24,124 +25,162 @@ type Detail = {
 }
 
 const pageSize = 50
+const statusTone = (status: string) => (status === 'active' ? 'good' : status === 'suspended' ? 'warn' : 'neutral')
 
-export function ConsumersView({ api }: { api: AdminApi }) {
-  const [users, setUsers] = useState<Consumer[]>([])
-  const [total, setTotal] = useState(0)
-  const [offset, setOffset] = useState(0)
+export function ConsumersView() {
+  const { api } = useConsole()
+  const confirm = useConfirm()
   const [filters, setFilters] = useState({ search: '', status: '', plan: '' })
-  const [stats, setStats] = useState<{ total: number; byStatus: Record<string, number>; byPlan: Record<string, number>; activeSessions: number } | null>(null)
-  const [plans, setPlans] = useState<Array<{ planCode: string; displayName: string; audience: string; isActive: boolean }>>([])
+  const [offset, setOffset] = useState(0)
   const [selected, setSelected] = useState<Detail | null>(null)
-  const loader = useAsyncAction()
   const action = useAsyncAction()
 
-  const load = (next = filters, nextOffset = offset) =>
-    loader.run(async () => {
-      const params = new URLSearchParams({ limit: String(pageSize), offset: String(nextOffset) })
-      for (const [key, value] of Object.entries(next)) if (value) params.set(key, value)
-      const [list, summary, planList] = await Promise.all([api.get(`/api/consumers?${params}`), api.get('/api/consumers/stats'), api.get('/api/plans')])
-      setUsers(list.users)
-      setTotal(list.total)
-      setStats(summary.stats)
-      setPlans(planList.plans.filter((plan: { audience: string; isActive: boolean }) => plan.isActive && plan.audience !== 'b2b'))
-    })
-  useEffect(() => { void load() }, [])
+  const list = useResource<{ users: Consumer[]; total: number }>(async () => {
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) })
+    for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value)
+    return api.get(`/api/consumers?${params}`)
+  }, [api, filters, offset])
+  const stats = useResource<{ total: number; byStatus: Record<string, number>; byPlan: Record<string, number>; activeSessions: number }>(async () => (await api.get('/api/consumers/stats')).stats, [api])
+  const plans = useResource<Array<{ planCode: string; displayName: string; audience: string; isActive: boolean }>>(
+    async () => (await api.get('/api/plans')).plans.filter((plan: { audience: string; isActive: boolean }) => plan.isActive && plan.audience !== 'b2b'),
+    [api],
+  )
 
-  const open = (userId: string) => void action.run(async () => { setSelected(await api.get(`/api/consumers/${userId}`)) })
+  const open = (userId: string) => void action.run(async () => setSelected(await api.get(`/api/consumers/${userId}`)))
 
-  const act = (userId: string, path: string, body?: unknown, confirmText?: string) => {
-    if (confirmText && !window.confirm(confirmText)) return
+  const act = async (userId: string, path: string, body?: unknown, ask?: { title: string; body: string; label: string }) => {
+    if (ask && !(await confirm({ title: ask.title, body: ask.body, confirmLabel: ask.label, tone: path === 'suspend' ? 'danger' : undefined }))) return
     void action.run(async () => {
       await (body === undefined ? api.send('POST', `/api/consumers/${userId}/${path}`) : api.send('PUT', `/api/consumers/${userId}/${path}`, body))
-      await load()
+      await Promise.all([list.reload(), stats.reload()])
       setSelected(await api.get(`/api/consumers/${userId}`))
-      return 'Done.'
+      return 'Saved.'
     })
   }
 
   const applyFilters = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
-    const next = { search: String(form.get('search') || ''), status: String(form.get('status') || ''), plan: String(form.get('plan') || '') }
-    setFilters(next)
     setOffset(0)
-    void load(next, 0)
+    setFilters({ search: String(form.get('search') || '').trim(), status: String(form.get('status') || ''), plan: String(form.get('plan') || '') })
   }
 
+  const users = list.data?.users ?? []
+  const total = list.data?.total ?? 0
+  const currentPlan = selected?.subscriptions.find((sub) => ['active', 'trialing', 'past_due', 'paused'].includes(sub.status))
+
   return (
-    <div className="admin-view">
-      <PageHeader eyebrow="Platform / Individuals" title="Individual users (B2C)" subtitle="Accounts on the public app: status, sessions and plans" onRefresh={() => void load()} busy={loader.busy} />
-      {loader.error && <Notice tone="error">{loader.error}</Notice>}
+    <div className="page">
+      <PageHeader
+        title="Individuals"
+        description="Personal accounts on the public app: their status, sessions and plans."
+        onRefresh={() => { void list.reload(); void stats.reload() }}
+        busy={list.loading}
+      />
+      {list.error && <Notice tone="error">{list.error}</Notice>}
       {action.error && <Notice tone="error">{action.error}</Notice>}
-      {stats && (
-        <div className="admin-stats">
-          <div className="dynamic-card admin-stat"><span>Accounts</span><strong>{stats.total}</strong></div>
-          <div className="dynamic-card admin-stat"><span>Active</span><strong>{stats.byStatus.active ?? 0}</strong></div>
-          <div className="dynamic-card admin-stat"><span>Suspended</span><strong>{stats.byStatus.suspended ?? 0}</strong></div>
-          <div className="dynamic-card admin-stat"><span>Signed in now</span><strong>{stats.activeSessions}</strong></div>
-        </div>
-      )}
-      <Card>
-        <form className="admin-form admin-form-inline" onSubmit={applyFilters}>
-          <input className="admin-input" name="search" placeholder="Search name, username or email" defaultValue={filters.search} />
-          <select className="admin-input" name="status" defaultValue={filters.status}><option value="">Any status</option><option>active</option><option>suspended</option><option>pending</option></select>
-          <select className="admin-input" name="plan" defaultValue={filters.plan}><option value="">Any plan</option>{plans.map((plan) => <option key={plan.planCode} value={plan.planCode}>{plan.displayName}</option>)}</select>
-          <button className="admin-button admin-button-primary">Filter</button>
-        </form>
-      </Card>
-      <div className="admin-grid">
-        <Card title={`${total} account(s)`}>
-          <table className="admin-table">
-            <thead><tr><th>User</th><th>Status</th><th>Plan</th><th>Sessions</th></tr></thead>
+
+      <div className="stats">
+        <Stat label="Accounts" icon={<User size={16} />} value={stats.data ? stats.data.total : '—'} />
+        <Stat label="Active" value={stats.data ? stats.data.byStatus.active ?? 0 : '—'} />
+        <Stat label="Suspended" value={stats.data ? stats.data.byStatus.suspended ?? 0 : '—'} />
+        <Stat label="Signed in now" value={stats.data ? stats.data.activeSessions : '—'} />
+      </div>
+
+      <div className="grid-main">
+        <Card flush>
+          <form className="toolbar" onSubmit={applyFilters} style={{ justifyContent: 'flex-start' }}>
+            <label className="search">
+              <Search size={15} />
+              <input className="input" type="search" name="search" placeholder="Name, username or email" defaultValue={filters.search} aria-label="Search individuals" />
+            </label>
+            <select className="input input-inline" name="status" defaultValue={filters.status} aria-label="Status" style={{ minWidth: 140 }}>
+              <option value="">Any status</option>
+              <option value="active">Active</option>
+              <option value="suspended">Suspended</option>
+              <option value="pending">Pending</option>
+            </select>
+            <select className="input input-inline" name="plan" defaultValue={filters.plan} aria-label="Plan" style={{ minWidth: 140 }}>
+              <option value="">Any plan</option>
+              {(plans.data ?? []).map((plan) => <option key={plan.planCode} value={plan.planCode}>{plan.displayName}</option>)}
+            </select>
+            <button className="btn btn-primary">Apply</button>
+          </form>
+          <Table minWidth={560}>
+            <thead><tr><th>Person</th><th>Status</th><th>Plan</th><th className="right">Sessions</th></tr></thead>
             <tbody>
               {users.map((user) => (
-                <tr key={user.userId} className={selected?.user.userId === user.userId ? 'admin-row-selected' : 'admin-row-link'} onClick={() => open(user.userId)}>
-                  <td><span className="admin-strong">{user.displayName}</span><div className="admin-hint">{user.username}{user.email ? ` · ${user.email}` : ''}</div></td>
-                  <td><Badge tone={user.status === 'active' ? 'good' : user.status === 'suspended' ? 'warn' : 'neutral'}>{user.status}</Badge></td>
-                  <td>{user.planCode ?? <span className="admin-muted">none</span>}</td>
-                  <td>{user.activeSessions}</td>
+                <tr key={user.userId} className={`row-link${selected?.user.userId === user.userId ? ' row-selected' : ''}`} onClick={() => open(user.userId)}>
+                  <td><span className="cell-title">{user.displayName}</span><span className="cell-sub">{user.username}{user.email ? ` · ${user.email}` : ''}</span></td>
+                  <td><Badge tone={statusTone(user.status)} dot>{user.status}</Badge></td>
+                  <td>{user.planCode ?? <span className="muted">None</span>}</td>
+                  <td className="right num">{user.activeSessions}</td>
                 </tr>
               ))}
+              {!users.length && !list.loading && <tr className="empty-row"><td colSpan={4}>No accounts match.</td></tr>}
             </tbody>
-          </table>
-          <div className="admin-form-inline">
-            <button className="admin-button" disabled={offset === 0} onClick={() => { const next = Math.max(0, offset - pageSize); setOffset(next); void load(filters, next) }}>Previous</button>
-            <span className="admin-hint">{total ? `${offset + 1}–${Math.min(offset + pageSize, total)} of ${total}` : ''}</span>
-            <button className="admin-button" disabled={offset + pageSize >= total} onClick={() => { const next = offset + pageSize; setOffset(next); void load(filters, next) }}>Next</button>
+          </Table>
+          <div className="card-foot">
+            <span>{total ? `${offset + 1}–${Math.min(offset + pageSize, total)} of ${total}` : 'No results'}</span>
+            <div className="actions">
+              <button type="button" className="btn btn-sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
+              <button type="button" className="btn btn-sm" disabled={offset + pageSize >= total} onClick={() => setOffset(offset + pageSize)}>Next</button>
+            </div>
           </div>
         </Card>
-        {selected && (
-          <Card title={selected.user.displayName}>
-            <dl className="admin-dl">
-              <dt>Username</dt><dd>{selected.user.username}</dd>
+
+        {selected ? (
+          <Card
+            title={selected.user.displayName}
+            subtitle={<span className="mono">{selected.user.username}</span>}
+            actions={<button type="button" className="btn btn-ghost btn-icon btn-sm" onClick={() => setSelected(null)} aria-label="Close details"><X size={15} /></button>}
+          >
+            <dl className="kv">
               <dt>Email</dt><dd>{selected.user.email ?? '—'}</dd>
-              <dt>Status</dt><dd><Badge tone={selected.user.status === 'active' ? 'good' : 'warn'}>{selected.user.status}</Badge></dd>
+              <dt>Status</dt><dd><Badge tone={statusTone(selected.user.status)} dot>{selected.user.status}</Badge></dd>
               <dt>Joined</dt><dd>{formatDate(selected.user.createdAt)}</dd>
-              <dt>Projects / groups</dt><dd>{selected.projects} / {selected.groups}</dd>
-              <dt>Active sessions</dt><dd>{selected.activeSessions}</dd>
-              <dt>Plan</dt><dd>{selected.subscriptions.find((sub) => ['active', 'trialing', 'past_due', 'paused'].includes(sub.status))?.planCode ?? 'none'}</dd>
+              <dt>Projects / groups</dt><dd className="num">{selected.projects} / {selected.groups}</dd>
+              <dt>Active sessions</dt><dd className="num">{selected.activeSessions}</dd>
+              <dt>Plan</dt><dd>{currentPlan ? <>{currentPlan.planCode} <StatusBadge status={currentPlan.status} /></> : <span className="muted">None</span>}</dd>
             </dl>
-            <div className="admin-form-inline">
-              {selected.user.status === 'active'
-                ? <button className="admin-button" onClick={() => act(selected.user.userId, 'suspend', undefined, `Suspend ${selected.user.username}? Their sessions end immediately.`)}>Suspend</button>
-                : <button className="admin-button" onClick={() => act(selected.user.userId, 'reactivate')}>Reactivate</button>}
-              <button className="admin-button" onClick={() => act(selected.user.userId, 'revoke-sessions')}>End sessions</button>
-              <select className="admin-input admin-select-inline" defaultValue="" onChange={(event) => { if (event.target.value) act(selected.user.userId, 'plan', { planCode: event.target.value, status: 'active' }, `Change plan to ${event.target.value}?`) }}>
+            <div className="form-inline">
+              {selected.user.status === 'active' ? (
+                <button type="button" className="btn btn-danger" disabled={action.busy} onClick={() => void act(selected.user.userId, 'suspend', undefined, { title: `Suspend ${selected.user.username}?`, body: 'Their sessions end immediately and they cannot sign in until reactivated.', label: 'Suspend' })}>Suspend</button>
+              ) : (
+                <button type="button" className="btn btn-primary" disabled={action.busy} onClick={() => void act(selected.user.userId, 'reactivate')}>Reactivate</button>
+              )}
+              <button type="button" className="btn" disabled={action.busy || !selected.activeSessions} onClick={() => void act(selected.user.userId, 'revoke-sessions')}>End sessions</button>
+              <select
+                className="input input-inline"
+                value=""
+                aria-label="Change plan"
+                onChange={(event) => {
+                  const planCode = event.target.value
+                  if (planCode) void act(selected.user.userId, 'plan', { planCode, status: 'active' }, { title: `Move ${selected.user.username} to ${planCode}?`, body: 'The new plan applies immediately.', label: 'Change plan' })
+                }}
+              >
                 <option value="">Change plan…</option>
-                {plans.map((plan) => <option key={plan.planCode} value={plan.planCode}>{plan.displayName}</option>)}
+                {(plans.data ?? []).map((plan) => <option key={plan.planCode} value={plan.planCode}>{plan.displayName}</option>)}
               </select>
             </div>
             {action.message && <Notice tone="success">{action.message}</Notice>}
-            <h3 className="admin-subhead">Recent activity</h3>
-            <table className="admin-table">
-              <tbody>
+            <div className="subhead">Recent activity</div>
+            {selected.recentEvents.length === 0 ? (
+              <p className="hint">No events.</p>
+            ) : (
+              <div className="list" style={{ margin: '0 calc(var(--card-pad) * -1)' }}>
                 {selected.recentEvents.map((event, index) => (
-                  <tr key={index}><td className="admin-mono">{formatDate(event.occurred_at)}</td><td><code>{event.action}</code></td><td><Badge tone={event.outcome === 'success' ? 'good' : 'bad'}>{event.outcome}</Badge></td></tr>
+                  <div key={index} className="list-item">
+                    <div className="list-main"><strong className="mono" style={{ fontSize: 12.5 }}>{event.action}</strong><span>{formatDate(event.occurred_at)}</span></div>
+                    <span className="list-aside">{event.outcome === 'success' ? <Badge tone="good">success</Badge> : <Badge tone="bad">{event.outcome}</Badge>}<span>{formatRelative(event.occurred_at)}</span></span>
+                  </div>
                 ))}
-                {!selected.recentEvents.length && <tr><td className="admin-muted">No events.</td></tr>}
-              </tbody>
-            </table>
+              </div>
+            )}
+          </Card>
+        ) : (
+          <Card>
+            <EmptyState icon={<User size={20} />} title="Select a person">See their plan, sessions and recent activity, and suspend or reactivate them.</EmptyState>
           </Card>
         )}
       </div>

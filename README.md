@@ -20,6 +20,264 @@ As shipped, the folder contains no secrets and no database. Every password and
 key is generated on the server during installation, and the database is
 created empty and then migrated.
 
+This repository is the **foundation only**. It contains no product modules
+and no customer data. Products are built on it as modules (section 0.6).
+
+**Contents**
+
+- [0. Orientation for developers and coding agents](#0-orientation-for-developers-and-coding-agents): how the code fits together, how to run it, and how to extend it
+- Sections 1–10: installing and operating a server with `setup.sh`
+
+---
+
+## 0. Orientation for developers and coding agents
+
+Read this section before changing code. It gives you the map. The deeper
+references are [`docs/architecture/extending-the-foundation.md`](docs/architecture/extending-the-foundation.md)
+(the module contract and admin surface),
+[`docs/architecture/adr-001-tenancy-scaling-tiers.md`](docs/architecture/adr-001-tenancy-scaling-tiers.md)
+(isolation tiers and data placement), and
+[`docs/operations/robustness-runbook.md`](docs/operations/robustness-runbook.md).
+
+### 0.1 Five processes, four hostnames, one database
+
+```text
+Browser ──HTTPS──> edge (Cloudflare Tunnel or your proxy)
+   ROOT_DOMAIN, www      -> landing        :3651  static site (frontend/landing)
+   platform.ROOT_DOMAIN  -> platform BFF   :3656  backend/        + frontend/platform (operator console)
+   user.ROOT_DOMAIN      -> public BFF     :3657  backend/public  + frontend/public   (individual users, B2C)
+   *.ROOT_DOMAIN         -> tenant BFF     :6355  backend/tenant  + frontend/tenant   (one workspace per tenant)
+   app.ROOT_DOMAIN       -> tenant BFF     :6355  shared sign-in: company + username + password
+                            provisioner    (no port)  backend/provisioner: job worker for tenant lifecycle
+
+All BFFs ──> PgBouncer pools (platform :3658, public :3659, tenant :6360) ──> PostgreSQL :5433, database platform_db
+```
+
+- Every BFF serves its own frontend's built `dist/` and answers same-origin `/api/*`.
+  Browsers never talk to the database or to another service.
+- The **tenant BFF** resolves the tenant from the `Host` header
+  (`backend/tenant/src/tenant-context.ts`, `TenantResolver`). Only an exact
+  hostname registered as active in `platform.tenant_domain` is served.
+  `app.ROOT_DOMAIN` (`TENANT_APP_HOST`) is a shared host where the user names
+  the company at sign-in. The answer does not reveal whether a company or user
+  exists, and the company is then remembered in a signed cookie until sign-out.
+- The **provisioner** polls `platform.tenant_provisioning_job` and runs each job
+  as numbered, retryable steps. The job types are: create (about 20 steps,
+  ending in `CREATE_TENANT_OWNER` and `ACTIVATE_TENANT`), migrate (schema
+  upgrade), relocate data (`RELOC_*`), move files (`STORAGE_*`) and deprovision
+  (`DEPROV_*`). A failed job can be retried from the step that failed.
+
+### 0.2 Data model and isolation
+
+| Schema | Holds | Who reaches it |
+|---|---|---|
+| `platform` | Operators, sessions, audit, tenant registry and domains, provisioning jobs, plans, the configuration registry, integrations | Platform BFF through `SECURITY DEFINER` functions; the provisioner role |
+| `consumer` | B2C individuals, their subscriptions and groups | Public BFF (`consumer_bff_login`), with RLS |
+| `tenant_<key>` (one per tenant) | That tenant's users, roles, sessions, teams, settings, files metadata, audit, module tables | Only that tenant's database role, under **forced RLS** keyed on `app.tenant_id` |
+
+- Tenant requests run in one transaction with `SET LOCAL ROLE <tenant role>`,
+  `search_path = <schema>, pg_catalog` and `app.tenant_id` set
+  (`backend/tenant/src/tenant-database.ts`). Modules get this from
+  `kit.withTenant()` and must never open connections themselves.
+  `app.user_id` carries the signed-in user, for module RLS policies.
+- The tenant schema's privileges and RLS are **declared**, never hand-written:
+  every table is listed in `database/migrations/tenant/access-manifest.json`.
+  Migrations reset grants to exactly the manifest, and they fail if a table is
+  missing from it.
+- Tenants can use a pooled login (many small tenants, one PgBouncer user) or a
+  dedicated one. Their data can live on this server (the default), or in their
+  own PostgreSQL database or S3-compatible bucket ("bring your own", tested
+  before activation). See ADR-001.
+
+### 0.3 Security model (the parts you must not break)
+
+- **Sessions:** server-side sessions. Only a SHA-256 of the token is stored.
+  `__Host-` cookies, CSRF token on every mutation, and an `Origin` check.
+  Passwords are hashed with argon2id.
+- **Platform operators:** roles `platform_owner`, `platform_admin` and
+  `platform_viewer`.
+  - Every mutation, and reading live server telemetry, requires a WebAuthn
+    security-key check from the last 5 minutes (`backend/src/mfa.ts`). The
+    console runs the check on demand: `api.send` steps up automatically, and
+    read-only panels show a *Verify with security key* button.
+  - Writes go through database functions that keep invariants. For example,
+    at least one active owner always remains.
+- **Tenant users:** canonical roles `tenant_owner`, `tenant_admin`,
+  `tenant_manager`, `tenant_member` and `tenant_viewer`, mapped to permission
+  codes (`tenant.users.read`, `tenant.users.roles`, `tenant.settings.manage`,
+  …).
+  - Permissions are checked server-side with `kit.requirePermission`.
+  - A user whose password an administrator set or reset must change it first.
+    A server `preHandler` answers every other API call with 403
+    `PASSWORD_CHANGE_REQUIRED`.
+- **Sign-in:** Cloudflare Turnstile (`action: "login"`) on every sign-in page,
+  plus login throttling. `LOGIN_CHALLENGE=none` (servers) together with
+  `VITE_LOGIN_CHALLENGE=none` (build) disables Turnstile, for private
+  sandboxes only.
+- **Invitations:** 256-bit single-use tokens, stored hashed, carried in the
+  URL fragment.
+
+### 0.4 Repository map (where to look)
+
+| Path | What |
+|---|---|
+| `backend/src/server.ts` | Platform BFF: auth, sessions, operator MFA, Cloudflare DNS, system telemetry, tenant create/suspend/resume/remove |
+| `backend/src/admin-routes.ts` | Platform admin API: tenant detail and profile, plans, configuration values, operators, audit, fleet, consumers, integrations |
+| `backend/src/tenant-provisioning.ts` | Validation and creation of provisioning jobs (subdomain rules, owner bootstrap, modules, plan) |
+| `backend/provisioner/src/worker.ts` | The job worker; `tenant-migrations.ts` applies tenant schema versions; `tenant-operations.ts` relocation and upgrade helpers |
+| `backend/tenant/src/server.ts` | Tenant BFF: host resolution, app host, sign-in, sessions, users/roles/categories/default password/import, audit, module mounting, static serving |
+| `backend/tenant/src/modules/` | Tenant modules. **Core:** `invitations`, `settings`, `teams` (departments and groups), `files`, `integrations`. **Application:** `delegations` (the reference module, off by default). `types.ts` is the module contract |
+| `backend/public/src/server.ts` | Public (B2C) BFF |
+| `dependency/platform/ServerKit` | Shared server code: configuration resolution and validation, storage (local and S3), integrations, network policy, invitations, Turnstile, shared state |
+| `dependency/ui` | Shared React pieces: `useTurnstile` and `TurnstileSlot` (fixed-size sign-in widget), `MetricCard`, base styles |
+| `frontend/platform` | Operator console (React and Vite). `src/App.tsx` is the shell and hash router; `src/shell/nav.ts` holds the navigation and per-role access; `src/pages/*` are the dashboard, tenants, new tenant, tenant detail tabs, domains and server; `src/admin/*` are plans, configuration, operators, audit, fleet, individuals and security; `src/admin/ui.tsx` is the component kit |
+| `frontend/tenant` | Tenant workspace: sign-in (with company on the app host), forced password change, first-login setup wizard, welcome page, users (add, invite, CSV import, categories, default password, reset), departments and groups, files, audit, settings |
+| `frontend/public`, `frontend/landing` | B2C app; generic landing page |
+| `database/migrations/NNN_*.sql` + `manifest.json` | Platform migrations, applied in manifest order with checksums (`scripts/platform-migrate.mjs`) |
+| `database/migrations/tenant/versions/NNN_*.sql` | Tenant schema versions, applied to every tenant schema (`npm run migrate:tenants`; the provisioner applies them to new tenants) |
+| `setup.sh`, `deploy/templates/`, `scripts/foundation/` | Installer, rendered unit and config templates, Cloudflare and demo helpers |
+| `scripts/` | Migrations, tenant reconciliation, operator CLI (`platform-operator.mjs`), backup and restore drill, secret scan, test cluster |
+| `tests/unit`, `tests/integration`, `tests/fixtures`, `tests/helpers` | Test suites and the fixture tenants `alpha` and `beta` |
+
+### 0.5 Working on the code
+
+Requirements: Node.js 22+ (CI uses 24), and the PostgreSQL 16 server
+binaries (`/usr/lib/postgresql/16/bin`, or set `PG_BIN`) for tests.
+
+```bash
+npm ci                     # one lockfile for all workspaces
+npm run build              # every workspace: backends to dist/, frontends to dist/
+npm run typecheck          # backends and shared packages
+npx tsc -b frontend/<app>  # one frontend (each has its own tsconfig)
+
+# The development loop: a throwaway PostgreSQL cluster with every migration
+# applied and two fixture tenants (alpha.sandbox.test, beta.sandbox.test)
+# provisioned through the real pipeline. Removed when the command exits.
+bash scripts/with-test-cluster.sh npm run test:unit
+bash scripts/with-test-cluster.sh                      # integration suite
+bash scripts/with-test-cluster.sh node --test tests/integration/<file>.test.mjs
+```
+
+- **Testing the BFFs.** Integration tests import the built servers
+  (`backend/*/dist/server.js`), call `createServer()` and drive them with
+  `app.inject()` against the real database. A new feature's test should
+  follow `tests/integration/admin-controls.test.mjs` or
+  `tests/integration/tenant-onboarding.test.mjs`. Both provision a tenant,
+  enable a feature, then assert the allowed and the denied paths.
+- **Testing the UIs in a browser.**
+  `tests/integration/platform-console.test.mjs` serves the built console
+  through the platform BFF and routes a Playwright browser's requests to
+  `app.inject()`. It needs no DNS, TLS or Turnstile. A seeded session row
+  stands in for sign-in. Reuse this pattern for UI work. Run `npm run build`
+  first: the test is skipped without `frontend/platform/dist`.
+- **Running the servers by hand.** The BFFs read their configuration from
+  environment variables. `with-test-cluster.sh` exports a complete test set,
+  so `bash scripts/with-test-cluster.sh npm run start:tenant:bff` runs a
+  server against the throwaway database. Real browser sign-in needs HTTPS on
+  real hostnames (`__Host-` cookies, WebAuthn). For that, install on a VM with
+  `setup.sh`; `EDGE_MODE=none` with a local reverse proxy and
+  `LOGIN_CHALLENGE=none` works for a sandbox.
+- **CI** (`.github/workflows/ci.yml`) runs on PostgreSQL 16 and PgBouncer. It
+  runs the build, typecheck, unit and integration tests, the migration ledger
+  and tenant registry checks, the secret scan and a restore drill. Tests that
+  are skipped fail the job.
+
+### 0.6 Building on the foundation (modules)
+
+A product feature is a **module**: tenant tables, routes, configuration keys
+and UI. It plugs in without touching the security code. The full checklist,
+with code, is in `docs/architecture/extending-the-foundation.md`. In short:
+
+1. **Configuration keys.** Add a platform migration (the next free number, appended to
+   `database/migrations/manifest.json`) that inserts `module.<code>` (a
+   feature, **off by default**) and any limits or settings into
+   `platform.config_definition`. Operators switch it on per platform, plan or
+   tenant. The *New tenant* form and the tenant's *Plan & modules* tab list
+   every `module.*` key automatically.
+2. **Tenant tables.** Add `database/migrations/tenant/versions/NNN_<name>.sql`.
+   - Use the **next contiguous** number: the runner refuses gaps. Plain SQL, no
+     `begin`/`commit`, `search_path` is the tenant schema.
+   - Seed the module's permissions into `permission` and `role_permission`.
+   - Declare every new table in `access-manifest.json`.
+   - To grant access to a department or group, reference `team(team_id)`.
+3. **Routes.** Export a `TenantModule` with a `featureKey` from
+   `backend/tenant/src/modules/<code>.ts` and add it to `applicationModules`
+   in `modules/index.ts`.
+   - Where the feature is off, every route answers 404.
+   - Use `kit.requireSession`, `kit.requirePermission`, `kit.requireCsrf` on
+     mutations, `kit.withTenant` for every query, `kit.config` for settings,
+     `kit.files` for files and `kit.audit` for state changes.
+   - Never take a schema, role or tenant identifier from the client.
+4. **UI.** Read `config['module.<code>']` from `/api/tenant/bootstrap` (only
+   keys marked `is_public` are present) to show the module in the tenant
+   workspace's navigation (`frontend/tenant/src/App.tsx`, the `nav` list).
+5. **Data moves.** When a tenant's data moves to another database, rows are
+   copied verbatim with `app.relocating = 'true'`, so module triggers should
+   skip derived writes while `current_setting('app.relocating', true) = 'true'`.
+6. **Minimum schema.** If the tenant BFF starts to depend on a new tenant
+   migration, raise `MIN_SUPPORTED_SCHEMA_VERSION` in
+   `backend/tenant/src/tenant-context.ts`. Older tenants then answer 503 until
+   they are upgraded (Console › Fleet & schema).
+
+The reference module is `backend/tenant/src/modules/delegations.ts`.
+
+### 0.7 Conventions
+
+- **Applied migrations:** never edit one. Platform and tenant migrations are
+  checksummed. Write a new one instead (`npm run verify:migrations` catches
+  drift).
+- **Admin control:** everything an operator should control is a configuration
+  key or an admin API, never a constant per deployment. Branding, the product
+  name and domains come from configuration (`/api/public-config`, tenant
+  branding), not from code.
+- **Tests:** every new route gets an integration test covering the allowed and
+  the denied paths. The suite must pass with nothing skipped.
+- **Secrets:** never commit secrets or customer data. `.env/secrets.env` ships
+  blank; real values live in `runtime/` (ignored), and
+  `npm run scan:secrets` checks the built bundles.
+
+### 0.8 What changed in the last sync (2026-10-19)
+
+The foundation picked up these changes from the production system they were
+developed on:
+
+- **Operator console redesign.**
+  - A grouped sidebar with per-role access, hash routes (back, refresh and
+    links work), light and dark themes, and phone layout.
+  - A dashboard built around *Needs attention*: failed tenants, pending
+    upgrades, resource pressure and recent denials.
+  - Per-tenant pages with tabs (overview, profile, plan and modules,
+    administrator access, storage and data, configuration, jobs).
+  - In-app confirmations, including typing the subdomain to remove a tenant.
+- **Tenant onboarding.**
+  - The first administrator's login can be set during provisioning (platform
+    migration 036, step `CREATE_TENANT_OWNER`); an emailed invitation remains
+    an option.
+  - Modules are chosen at creation.
+  - A removed tenant releases its subdomain for reuse (039).
+- **Tenant workspace.**
+  - A welcome page and a first-login setup wizard.
+  - Users with administrator and user kinds, user categories, CSV import, and
+    a workspace default password with administrator reset and a forced change
+    (tenant migrations 009–011).
+  - Departments and groups as a core module (012).
+  - The shared `app.` host with company sign-in.
+- **Operator self-service.** Operators change their own password (037);
+  telemetry reads require a security-key check.
+- **Hardening.**
+  - Lookup indexes (tenant migration 008) and capacity and security
+    hardening (033).
+  - Provisioning retry and audit fixes (035).
+  - Fastify client errors keep their 4xx status.
+  - Stricter static-file caching, and stale-chunk protection in the tenant
+    build.
+
+Known follow-up: file writes already take the shared side of the
+`skeleton-local-storage-backup` advisory lock, but
+`scripts/backup-platform-db.sh` does not yet hold the exclusive side while
+collecting. Backups taken during uploads can therefore include a file without
+its row, or the reverse.
+
 ---
 
 ## 1. Requirements
@@ -307,7 +565,7 @@ cluster and verifies the tenant schemas and isolation. Run it regularly. See
 | `APP_SLUG ... is already installed from <other folder>` | Give this folder its own `APP_SLUG` and ports, or uninstall the other one from its own folder. |
 | A service does not start | `sudo ./setup.sh logs <service>` or `journalctl -u <slug>-<service> -n 100` |
 | Cloudflare step fails with DNS conflicts | Remove the listed records, or set `CLOUDFLARE_REPLACE_DNS=true`. |
-| Tenant stuck in *provisioning* | Look at *Console › Tenants › job* for the failed step, then `logs provisioner`. Retry from the console. |
+| Tenant stuck in *provisioning* | Open the tenant in *Console › Tenants* and check its Jobs tab for the failed step, then `logs provisioner`. Retry from the console. |
 | Edge verification fails with `EDGE_MODE=none` | Keep `TENANT_EDGE_VERIFY=auto` (off without the Cloudflare API), or make sure your proxy serves the wildcard. |
 | Lost owner password | `sudo ./setup.sh owner-password` |
 | Start over from scratch | `sudo ./setup.sh uninstall --purge`, then `install` again. |

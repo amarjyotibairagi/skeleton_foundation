@@ -1,50 +1,32 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
-import { MetricCard } from '@skeleton/ui/MetricCard'
+import { useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react'
+import { TurnstileSlot } from '@skeleton/ui/TurnstileSlot'
 import { useTurnstile } from '@skeleton/ui/useTurnstile'
 import { WorkspaceSettings } from './WorkspaceSettings'
 import { FilesPage } from './FilesPage'
 import { IntegrationsSettings } from './IntegrationsSettings'
+import { TeamForm, TeamsPage, useTeams, type Team } from './workspace/Teams'
+import { AddUserForm, CategoryManager, ChangePasswordForm, DefaultPasswordForm, ForcedPasswordChange, ImportUsersForm, SetupWizard, createTenantApi, useUserCategories } from './workspace/UserAdmin'
 import {
-  Activity,
   ArrowRight,
-  ArrowRightLeft,
-  BadgeCheck,
-  Bell,
-  Building2,
   Check,
-  CheckCircle2,
-  ChevronDown,
-  CircleGauge,
-  Clock3,
-  Database,
   Eye,
   EyeOff,
   FileClock,
   FileText,
-  FolderKanban,
+  Home,
   KeyRound,
-  Layers,
-  Lock,
   LogOut,
   Menu,
-  MoreHorizontal,
-  Plus,
   RefreshCw,
   Search,
   Settings,
-  Shield,
-  ShieldAlert,
-  ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  TrendingUp,
-  User,
+  Upload,
   UserCheck,
+  Tags,
   UserPlus,
   Users,
   X,
-  XCircle,
-  Zap,
+  Building2,
 } from 'lucide-react'
 
 const API_ORIGIN = import.meta.env.VITE_TENANT_API_ORIGIN || ''
@@ -59,6 +41,15 @@ const CANONICAL_ROLE: Record<TenantRole, string> = {
   guest: 'tenant_viewer',
 }
 
+const ROLE_INFO: Record<TenantRole, { label: string; summary: string }> = {
+  admin: { label: 'Administrator', summary: 'Full control of members, roles, settings and the audit trail.' },
+  manager: { label: 'Manager', summary: 'Adds users and viewers, runs their departments and groups, and reviews the audit trail.' },
+  user: { label: 'User', summary: 'Uses the workspace and the modules shared with them.' },
+  guest: { label: 'Viewer', summary: 'Read-only access to what is shared with them.' },
+}
+
+const ROLES = ['admin', 'manager', 'user', 'guest'] as const
+
 type TenantUser = {
   id: string
   username: string
@@ -66,8 +57,14 @@ type TenantUser = {
   email: string
   status: string
   role: TenantRole
+  canonicalRole?: string
   roleDescription?: string
   createdAt?: string
+  category?: { id: string; name: string } | null
+  /** On the signed-in user: an administrator set the password, change it first. */
+  mustChangePassword?: boolean
+  /** In the users list: the same, shown to administrators. */
+  passwordChangeRequired?: boolean
 }
 
 type AuditLog = {
@@ -88,20 +85,145 @@ type TenantInfo = {
   primaryColor: string
   accentColor: string
   planName: string
+  loginMessage: string
+  logoUrl: string | null
+}
+
+type NavId = 'Overview' | 'Members' | 'Teams' | 'Audit' | 'Files' | 'Settings'
+
+function initialsOf(name: string): string {
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((n) => n[0])
+      .join('')
+      .slice(0, 2)
+      .toUpperCase() || '·'
+  )
+}
+
+/** `auth:login` → "Auth login"; good enough for codes the UI does not know. */
+function humanAction(action: string): string {
+  const known: Record<string, string> = {
+    'auth:login': 'Signed in',
+    'auth:logout': 'Signed out',
+    'auth:login_failed': 'Sign-in failed',
+    'auth:turnstile_failed': 'Verification failed',
+    'user:create': 'Added a user',
+    'user:invite': 'Invited a user',
+    'user:category': 'Changed a user category',
+    'user:password_change': 'Changed their password',
+    'user:password_reset': 'Reset a user\'s password',
+    'workspace:default_password': 'Changed the default password',
+    'user_category:create': 'Created a user category',
+    'user_category:delete': 'Removed a user category',
+    'team:create': 'Created a department or group',
+    'team:update': 'Changed a department or group',
+    'team:archive': 'Archived a department or group',
+  }
+  if (known[action]) return known[action]
+  const words = action.replace(/[:._]+/g, ' ').trim()
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const min = Math.round(diff / 60000)
+  if (min < 1) return 'just now'
+  if (min < 60) return `${min} min ago`
+  const h = Math.round(min / 60)
+  if (h < 24) return `${h} h ago`
+  const d = Math.round(h / 24)
+  return d < 7 ? `${d} d ago` : new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+}
+
+function BrandMark({ info, size = 40 }: { info: TenantInfo; size?: number }) {
+  return (
+    <span className="ws-mark" style={{ width: size, height: size, fontSize: size * 0.38 }}>
+      {info.logoUrl ? <img src={info.logoUrl} alt="" /> : initialsOf(info.name)}
+    </span>
+  )
+}
+
+// Sign-in backdrop: faint route lines with stops drifting over the brand gradient.
+const LOGIN_ROUTES = [
+  'M-40 760 C 220 700, 360 520, 600 540 S 980 700, 1180 560 S 1500 300, 1660 340',
+  'M-40 300 C 180 360, 300 220, 520 260 S 860 460, 1060 380 S 1380 140, 1660 180',
+  'M200 1040 C 260 820, 420 700, 640 720 S 900 900, 1100 820 S 1360 620, 1660 660',
+  'M-40 520 C 160 480, 260 600, 460 580 S 740 380, 960 420 S 1260 560, 1660 480',
+  'M900 -40 C 860 160, 980 260, 1000 420 S 900 760, 1020 1040',
+  'M420 -40 C 460 120, 360 260, 400 400 S 560 640, 520 1040',
+]
+const LOGIN_STOPS: [number, number][] = [
+  [600, 540], [1180, 560], [520, 260], [1060, 380], [640, 720], [1100, 820], [460, 580], [960, 420], [1000, 420], [400, 400], [300, 228], [1380, 142],
+]
+
+function LoginBackdrop() {
+  return (
+    <div className="ws-login-backdrop" aria-hidden>
+      <svg viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+        {LOGIN_ROUTES.map((d, i) => (
+          <g key={i}>
+            <path d={d} className="base" />
+            <path d={d} className="flow" style={{ animationDelay: `${i * -2.3}s` }} />
+          </g>
+        ))}
+        {LOGIN_STOPS.map(([x, y], i) => (
+          <circle key={i} cx={x} cy={y} r="4" className="stop" style={{ animationDelay: `${i * 0.45}s` }} />
+        ))}
+      </svg>
+    </div>
+  )
+}
+
+function RolePill({ role }: { role: TenantRole }) {
+  return (
+    <span className="ws-role" data-role={role}>
+      {ROLE_INFO[role]?.label ?? role}
+    </span>
+  )
+}
+
+function Modal({ title, onClose, children, footer }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return (
+    <div className="ws-scrim" onClick={onClose}>
+      <div className="ws-modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
+        <header>
+          <h3>{title}</h3>
+          <button type="button" className="ws-icon-btn" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="ws-modal-body">{children}</div>
+        {footer && <footer>{footer}</footer>}
+      </div>
+    </div>
+  )
 }
 
 export default function App() {
   const [tenantInfo, setTenantInfo] = useState<TenantInfo>({
     tenantId: '',
     slug: '',
-    name: 'Enterprise Workspace',
+    name: 'Workspace',
     domain: '',
     description: '',
     primaryColor: '#2563eb',
     accentColor: '#0f172a',
     planName: 'Enterprise',
+    loginMessage: '',
+    logoUrl: null,
   })
 
+  // Shared app host (app.<domain>): the company is chosen at sign-in and remembered on the device.
+  const [appMode, setAppMode] = useState<{ company: string | null } | null>(null)
+  const [company, setCompany] = useState('')
   // Auth state
   const [currentUser, setCurrentUser] = useState<TenantUser | null>(null)
   const [checkingSession, setCheckingSession] = useState(true)
@@ -113,10 +235,11 @@ export default function App() {
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
-  const { isVerified, turnstileToken, isCollapsed, isBadgeVisible, turnstileContainerRef, resetTurnstile } = useTurnstile({
+  const turnstile = useTurnstile({
     enabled: !checkingSession && !currentUser,
     onError: setErrorMsg,
   })
+  const { isVerified, turnstileToken, resetTurnstile } = turnstile
 
   // Workspace UI state
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -124,19 +247,65 @@ export default function App() {
   const [editRoleUser, setEditRoleUser] = useState<TenantUser | null>(null)
   const [toast, setToast] = useState('')
   const [search, setSearch] = useState('')
-  const [roleFilter, setRoleFilter] = useState('')
-  const [activeNav, setActiveNav] = useState('Overview')
+  const [roleFilter, setRoleFilter] = useState<TenantRole | ''>('')
+  const [activeNav, setActiveNav] = useState<NavId>('Overview')
+  const [tenantConfig, setTenantConfig] = useState<Record<string, unknown>>({})
   const [members, setMembers] = useState<TenantUser[]>([])
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([])
   const [isLoadingData, setIsLoadingData] = useState(false)
   const [inviteResult, setInviteResult] = useState<{ name: string; link: string; delivered: boolean } | null>(null)
+  const [categoriesOpen, setCategoriesOpen] = useState(false)
+  const [addUserOpen, setAddUserOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
+  const [defaultPasswordOpen, setDefaultPasswordOpen] = useState(false)
+  const [teamEdit, setTeamEdit] = useState<Team | 'new' | null>(null)
+  const [defaultPassword, setDefaultPassword] = useState<{ configured: boolean; updatedAt: string | null }>({ configured: false, updatedAt: null })
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const [setupPending, setSetupPending] = useState(false)
+  const tenantApi = useMemo(() => createTenantApi(csrfToken), [csrfToken])
 
+  const role: TenantRole = currentUser?.role ?? 'guest'
+  const can = {
+    // The user directory is for administrators and managers only.
+    members: role === 'admin' || role === 'manager',
+    invite: role === 'admin' || role === 'manager',
+    editRoles: role === 'admin' || role === 'manager',
+    audit: role === 'admin' || role === 'manager',
+    settings: role === 'admin',
+  }
+  const assignableRoles: TenantRole[] = role === 'manager' ? ['user','guest'] : currentUser?.canonicalRole === 'tenant_owner' ? ['admin','manager','user','guest'] : ['manager','user','guest']
+  const passwordMinLength = Number(tenantConfig['auth.password.min_length'] ?? 8) || 8
+  // Administrators can only be added by the owner (see canAssignRole).
+  const canAddAdministrators = currentUser?.canonicalRole === 'tenant_owner'
+  // Until a forced password change is done, the server answers everything else with 403.
+  const workspaceUnlocked = Boolean(currentUser) && !currentUser?.mustChangePassword
+  const { categories, reload: reloadCategories } = useUserCategories(tenantApi, workspaceUnlocked && can.members)
+  const { teams, loaded: teamsLoaded, reload: reloadTeams } = useTeams(tenantApi, workspaceUnlocked && can.members)
+  const loadDefaultPassword = async () => {
+    try {
+      const data = await tenantApi.send<{ configured: boolean; updatedAt: string | null }>('GET', '/api/v1/users/default-password')
+      setDefaultPassword({ configured: data.configured, updatedAt: data.updatedAt })
+    } catch {
+      setDefaultPassword({ configured: false, updatedAt: null })
+    }
+  }
+  useEffect(() => {
+    if (workspaceUnlocked && can.invite) void loadDefaultPassword()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceUnlocked, can.invite, tenantApi])
   // Load tenant metadata
   const loadTenantInfo = async () => {
     const res = await fetch(`${API_ORIGIN}/api/tenant/bootstrap`, { credentials: 'include' })
     const data = await res.json()
-    if (!res.ok || !data.tenant) throw new Error(data.message || 'Tenant workspace is unavailable.')
+    if (res.ok && data.app) setAppMode({ company: data.app.company ?? null })
+    if (res.ok && data.app && !data.tenant) {
+      setTenantInfo((info) => ({ ...info, name: 'Sign in', domain: window.location.hostname }))
+      document.title = 'Sign in'
+      return
+    }
+    if (!res.ok || !data.tenant) throw new Error(data.message || 'This workspace is unavailable.')
     const metadata = data.tenant.branding?.safeMetadata || {}
+    setTenantConfig(data.config || {})
     setTenantInfo({
       tenantId: data.tenant.tenantId,
       slug: data.tenant.subdomain,
@@ -146,11 +315,13 @@ export default function App() {
       primaryColor: data.tenant.branding?.primaryColor || '#2563eb',
       accentColor: data.tenant.branding?.secondaryColor || '#0f172a',
       planName: typeof metadata.planName === 'string' ? metadata.planName : 'Enterprise',
+      loginMessage: data.tenant.branding?.loginMessage || '',
+      logoUrl: data.tenant.branding?.logoUrl || null,
     })
     document.title = data.tenant.displayName
   }
 
-  // Check initial session
+  // Check the initial session.
   useEffect(() => {
     let cancelled = false
     Promise.all([
@@ -167,13 +338,15 @@ export default function App() {
             email: data.user.email,
             status: 'active',
             role: data.user.role || 'user',
+            canonicalRole: data.user.canonicalRole,
+            mustChangePassword: data.user.mustChangePassword === true,
           })
           setCsrfToken(data.csrfToken)
         }
       }),
     ])
       .catch(() => {
-        if (!cancelled) setErrorMsg('This tenant workspace could not be loaded.')
+        if (!cancelled) setErrorMsg('This workspace could not be reached. Check your connection and try again.')
       })
       .finally(() => {
         if (!cancelled) setCheckingSession(false)
@@ -190,8 +363,12 @@ export default function App() {
     if (!isVerified) return
 
     setErrorMsg(null)
+    if (appMode && !appMode.company && !company.trim()) {
+      setErrorMsg('Enter your company.')
+      return
+    }
     if (!username.trim()) {
-      setErrorMsg('Please enter your username.')
+      setErrorMsg('Enter your email or username.')
       return
     }
 
@@ -205,11 +382,17 @@ export default function App() {
           username: username.trim(),
           password,
           turnstileToken,
+          ...(appMode && !appMode.company ? { company: company.trim() } : {}),
         }),
       })
 
       const data = await res.json()
 
+      if (res.ok && data.success && appMode && !appMode.company) {
+        // First sign-in on the shared app: load the chosen company's workspace.
+        window.location.replace('/')
+        return
+      }
       if (res.ok && data.success) {
         setCurrentUser({
           id: data.user.id,
@@ -218,15 +401,17 @@ export default function App() {
           email: data.user.email,
           status: 'active',
           role: data.user.role || 'user',
+          canonicalRole: data.user.canonicalRole,
+          mustChangePassword: data.user.mustChangePassword === true,
         })
         setCsrfToken(data.csrfToken)
-        setToast(`Authenticated with ${tenantInfo.name}`)
+        setPassword('')
       } else {
-        setErrorMsg(data.message || `Invalid credentials for ${tenantInfo.name}.`)
+        setErrorMsg(data.message || 'That email and password did not match.')
         resetTurnstile()
       }
     } catch {
-      setErrorMsg('Unable to connect to tenant server. Please check connection.')
+      setErrorMsg('Unable to reach the server. Check your connection and try again.')
       resetTurnstile()
     } finally {
       setIsLoading(false)
@@ -243,37 +428,49 @@ export default function App() {
       })
       if (!response.ok) throw new Error('Logout failed')
     } catch {
-      setToast('Unable to log out. Please retry.')
+      setToast('Unable to sign out. Please retry.')
       return
     }
     setCurrentUser(null)
     setCsrfToken(null)
+    setMembers([])
+    setAuditLogs([])
     setUsername('')
     setPassword('')
+    setMobileOpen(false)
     resetTurnstile()
-    setToast('Logged out of tenant workspace.')
+    // The shared app forgets the company on a manual sign-out.
+    if (appMode) window.location.replace('/')
+  }
+
+  const forgetCompany = async () => {
+    await fetch(`${API_ORIGIN}/api/app/forget-company`, { method: 'POST', credentials: 'include' }).catch(() => undefined)
+    window.location.replace('/')
   }
 
   // Fetch members & audit logs for authenticated workspace
   const loadTenantData = async () => {
+    if (!currentUser || currentUser.mustChangePassword) return
+    const wantMembers = currentUser.role === 'admin' || currentUser.role === 'manager'
+    const wantAudit = currentUser.role === 'admin' || currentUser.role === 'manager'
+    if (!wantMembers && !wantAudit) return
     setIsLoadingData(true)
     try {
       const [usersRes, auditRes] = await Promise.all([
-        fetch(`${API_ORIGIN}/api/v1/users?limit=100`, { credentials: 'include' }),
-        fetch(`${API_ORIGIN}/api/v1/audit`, { credentials: 'include' }),
+        wantMembers ? fetch(`${API_ORIGIN}/api/v1/users?limit=100`, { credentials: 'include' }) : null,
+        wantAudit ? fetch(`${API_ORIGIN}/api/v1/audit`, { credentials: 'include' }) : null,
       ])
-
-      const [usersData, auditData] = await Promise.all([
-        usersRes.json(),
-        auditRes.json(),
-      ])
-
-      if (usersRes.ok && usersData.users) setMembers(usersData.users)
-      else setToast(usersData.message || 'Unable to load tenant members.')
-      if (auditRes.ok && auditData.logs) setAuditLogs(auditData.logs)
-      else if (auditRes.status !== 403) setToast(auditData.message || 'Unable to load tenant audit data.')
+      const [usersData, auditData] = await Promise.all([usersRes?.json(), auditRes?.json()])
+      if (usersRes) {
+        if (usersRes.ok && usersData.users) setMembers(usersData.users)
+        else setToast(usersData?.message || 'Unable to load members.')
+      }
+      if (auditRes) {
+        if (auditRes.ok && auditData.logs) setAuditLogs(auditData.logs)
+        else if (auditRes.status !== 403) setToast(auditData?.message || 'Unable to load the audit trail.')
+      }
     } catch {
-      setToast('Unable to load tenant data.')
+      setToast('Unable to load workspace data.')
     } finally {
       setIsLoadingData(false)
     }
@@ -285,24 +482,52 @@ export default function App() {
     }
   }, [currentUser])
 
+  // First sign-in of an administrator: offer the guided workspace setup.
+  useEffect(() => {
+    if (!currentUser || currentUser.role !== 'admin' || currentUser.mustChangePassword) {
+      setSetupPending(false)
+      return
+    }
+    let cancelled = false
+    tenantApi
+      .send<{ pending: boolean }>('GET', '/api/v1/setup')
+      .then((data) => !cancelled && setSetupPending(Boolean(data.pending)))
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id, currentUser?.mustChangePassword])
+
+  const handleCategoryChange = async (userId: string, categoryId: string | null) => {
+    try {
+      await tenantApi.send('PATCH', `/api/v1/users/${userId}/category`, { categoryId })
+      const category = categoryId ? categories.find((c) => c.id === categoryId) : null
+      setMembers((prev) => prev.map((m) => (m.id === userId ? { ...m, category: category ? { id: category.id, name: category.name } : null } : m)))
+      setToast(category ? `Category set to ${category.name}` : 'Category removed')
+      void reloadCategories()
+    } catch (error) {
+      setToast((error as Error).message)
+    }
+  }
+
   // Toast timer
   useEffect(() => {
     if (!toast) return
-    const timer = window.setTimeout(() => setToast(''), 3000)
+    const timer = window.setTimeout(() => setToast(''), 3200)
     return () => window.clearTimeout(timer)
   }, [toast])
 
   const filteredMembers = useMemo(() => {
+    const q = search.trim().toLowerCase()
     return members.filter((member) => {
-      const matchSearch =
-        !search ||
-        `${member.displayName} ${member.username} ${member.email}`.toLowerCase().includes(search.toLowerCase())
+      const matchSearch = !q || `${member.displayName} ${member.username} ${member.email}`.toLowerCase().includes(q)
       const matchRole = !roleFilter || member.role === roleFilter
       return matchSearch && matchRole
     })
   }, [members, search, roleFilter])
 
-  // Invite member
+  // Invite member: the invited person chooses their own password from the link.
   const handleInvite = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
@@ -310,6 +535,7 @@ export default function App() {
     const username = String(form.get('username') || '').toLowerCase()
     const email = String(form.get('email') || '').toLowerCase()
     const role = (form.get('role') || 'user') as TenantRole
+    const categoryId = String(form.get('categoryId') || '') || null
 
     try {
       const res = await fetch(`${API_ORIGIN}/api/v1/users`, {
@@ -319,19 +545,36 @@ export default function App() {
           ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
         },
         credentials: 'include',
-        body: JSON.stringify({ displayName, username, email, role: CANONICAL_ROLE[role] }),
+        body: JSON.stringify({ displayName, username, email, role: CANONICAL_ROLE[role], categoryId }),
       })
       const data = await res.json()
       if (data.success && data.user) {
-        setMembers((prev) => [{ ...data.user, role }, ...prev])
-        setToast(`Invited ${displayName} as ${role.toUpperCase()} to this workspace`)
+        setToast(`${displayName} invited as ${ROLE_INFO[role].label.toLowerCase()}`)
         setInviteDialogOpen(false)
         if (data.invitation) setInviteResult({ name: displayName, link: data.invitation.link, delivered: data.invitation.delivered })
+        void loadTenantData()
+        void reloadCategories()
       } else {
         setToast(data.message || 'Unable to invite this member.')
       }
     } catch {
       setToast('Unable to invite this member.')
+    }
+  }
+
+  const handleResetPassword = async (user: TenantUser) => {
+    if (!defaultPassword.configured) {
+      setToast('Set a default password first.')
+      setDefaultPasswordOpen(true)
+      return
+    }
+    if (!window.confirm(`Reset ${user.displayName}'s password to the workspace default? They will be signed out and must choose a new password at their next sign-in.`)) return
+    try {
+      const data = await tenantApi.send<{ message: string }>('POST', `/api/v1/users/${user.id}/reset-password`)
+      setMembers((prev) => prev.map((m) => (m.id === user.id ? { ...m, passwordChangeRequired: true, status: 'active' } : m)))
+      setToast(data.message)
+    } catch (error) {
+      setToast((error as Error).message)
     }
   }
 
@@ -350,7 +593,7 @@ export default function App() {
       const data = await res.json()
       if (data.success) {
         setMembers((prev) => prev.map((m) => (m.id === userId ? { ...m, role: newRole } : m)))
-        setToast(`Role updated to ${newRole.toUpperCase()}`)
+        setToast(`Role changed to ${ROLE_INFO[newRole].label.toLowerCase()}`)
         setEditRoleUser(null)
       } else {
         setToast(data.message || 'Unable to update this role.')
@@ -360,830 +603,480 @@ export default function App() {
     }
   }
 
-  const roleBadges: Record<TenantRole, { label: string; color: string; bg: string; icon: any }> = {
-    admin: { label: 'ADMIN', color: '#dc2626', bg: '#fef2f2', icon: ShieldAlert },
-    manager: { label: 'MANAGER', color: '#d97706', bg: '#fffbeb', icon: KeyRound },
-    user: { label: 'USER', color: '#2563eb', bg: '#eff6ff', icon: UserCheck },
-    guest: { label: 'GUEST', color: '#4b5563', bg: '#f3f4f6', icon: Users },
-  }
+  const brandStyle = { '--ws-brand': tenantInfo.primaryColor } as CSSProperties
 
   // Loading screen
   if (checkingSession) {
     return (
-      <div className="login-page-bg">
-        <div style={{ color: '#fff', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
-          <RefreshCw size={28} className="spin" />
-          <span style={{ fontSize: '14px', fontWeight: 500 }}>Connecting to {tenantInfo.name}...</span>
-        </div>
+      <div className="ws-splash" style={brandStyle}>
+        <span className="ws-splash-ring" />
       </div>
     )
   }
 
   // ==========================================
-  // UNIFIED LOGIN GATE SCREEN (TENANT BRANDED)
+  // SIGN IN (TENANT BRANDED)
   // ==========================================
   if (!currentUser) {
     return (
-      <div className="login-page-bg">
-        <div style={styles.loginCard}>
-          <div style={styles.header}>
-            <div
-              style={{
-                ...styles.logoBadge,
-                backgroundColor: '#f8fafc',
-                borderColor: tenantInfo.primaryColor,
-              }}
-            >
-              <Building2 size={24} color={tenantInfo.primaryColor} />
-            </div>
-            <div style={styles.titleRow}>
-              <h1 style={styles.title}>{tenantInfo.name}</h1>
-              <span
-                style={{
-                  ...styles.pillBadge,
-                  backgroundColor: '#f1f5f9',
-                  color: tenantInfo.accentColor,
-                }}
-              >
-                {tenantInfo.name.split(' ')[0]}
-              </span>
-            </div>
-            <p style={styles.subtitle}>Sign in with your enterprise workspace credentials</p>
-          </div>
+      <div className="ws-login" style={brandStyle}>
+        <LoginBackdrop />
+        <header className="ws-login-top">
+          <BrandMark info={tenantInfo} size={40} />
+          <span>{tenantInfo.name}</span>
+        </header>
 
-          {errorMsg && (
-            <div style={styles.errorBanner}>
-              <span>{errorMsg}</span>
-            </div>
-          )}
+        <main className="ws-login-center">
+          <div className="ws-login-card">
+            <h2>Sign in</h2>
+            {appMode && !appMode.company ? (
+              <p className="ws-login-sub">Sign in with your company account.</p>
+            ) : appMode ? (
+              <p className="ws-login-sub">
+                Signing in to <strong>{appMode.company}</strong>.{' '}
+                <button type="button" className="ws-link-btn" onClick={() => void forgetCompany()}>
+                  Not {appMode.company}? Change company
+                </button>
+              </p>
+            ) : (
+              <p className="ws-login-sub">Use your {tenantInfo.name} account.</p>
+            )}
 
-          <form onSubmit={handleLogin} style={styles.form}>
-            <div style={styles.fieldGroup}>
-              <label htmlFor="tenant-login-username" style={styles.label}>Corporate Username</label>
-              <div style={styles.inputWrapper}>
-                <User size={18} style={styles.inputIcon} />
+            {errorMsg && (
+              <div className="ws-alert" role="alert">
+                {errorMsg}
+              </div>
+            )}
+
+            <form onSubmit={handleLogin} className="ws-form">
+              {appMode && !appMode.company && (
+                <label className="ws-field">
+                  <span>Company</span>
+                  <input
+                    id="tenant-login-company"
+                    type="text"
+                    value={company}
+                    onChange={(e) => setCompany(e.target.value)}
+                    placeholder="Your company or workspace address"
+                    autoComplete="organization"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                  />
+                </label>
+              )}
+              <label className="ws-field">
+                <span>Email or username</span>
                 <input
                   id="tenant-login-username"
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. aarav.ganguly"
                   autoComplete="username"
-                  style={styles.input}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  inputMode="email"
                 />
-              </div>
-            </div>
+              </label>
 
-            <div style={styles.fieldGroup}>
-              <label htmlFor="tenant-login-password" style={styles.label}>Password</label>
-              <div style={styles.inputWrapper}>
-                <Lock size={18} style={styles.inputIcon} />
-                <input
-                  id="tenant-login-password"
-                  type={showPassword ? 'text' : 'password'}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
-                  autoComplete="current-password"
-                  style={styles.input}
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  style={styles.toggleButton}
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                </button>
-              </div>
-            </div>
+              <label className="ws-field">
+                <span>Password</span>
+                <span className="ws-input-wrap">
+                  <input
+                    id="tenant-login-password"
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete="current-password"
+                  />
+                  <button
+                    type="button"
+                    className="ws-reveal"
+                    onClick={() => setShowPassword(!showPassword)}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </span>
+              </label>
 
-            <div className={`turnstile-grid-wrapper ${isCollapsed ? 'collapsed' : ''}`}>
-              <div className="turnstile-grid-inner">
-                <div ref={turnstileContainerRef} style={styles.turnstileMount} />
-              </div>
-            </div>
+              <TurnstileSlot turnstile={turnstile} />
 
-            <div className={`verified-badge-wrapper ${isBadgeVisible ? 'visible' : ''}`}>
-              <div className="verified-badge-inner">
-                <div style={styles.verifiedPill}>
-                  <CheckCircle2 size={15} color="#059669" />
-                  <span>Security verification passed</span>
-                </div>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={!isVerified || isLoading}
-              className={`submit-btn ${isVerified && !isLoading ? 'active' : 'disabled'}`}
-              style={{
-                background: isVerified && !isLoading
-                  ? tenantInfo.primaryColor
-                  : '#e2e8f0',
-              }}
-            >
-              <span>{isLoading ? 'Signing In...' : `Sign In to ${tenantInfo.name.split(' ')[0]}`}</span>
-              <ArrowRight size={18} style={{ opacity: isVerified ? 1 : 0.4 }} />
-            </button>
-          </form>
-
-        </div>
+              <button type="submit" disabled={!isVerified || isLoading} className="ws-submit">
+                {isLoading ? <RefreshCw size={18} className="spin" /> : null}
+                <span>{isLoading ? 'Signing in…' : 'Sign in'}</span>
+                {!isLoading && <ArrowRight size={18} />}
+              </button>
+            </form>
+          </div>
+          {tenantInfo.loginMessage && <p className="ws-login-tagline">{tenantInfo.loginMessage}</p>}
+        </main>
+        <footer className="ws-login-foot">{tenantInfo.domain}</footer>
       </div>
     )
   }
 
   // ==========================================
-  // AUTHENTICATED TENANT WORKSPACE
+  // FORCED PASSWORD CHANGE
   // ==========================================
-  return (
-    <div className="app-shell">
-      {mobileOpen && (
-        <button
-          className="mobile-overlay"
-          aria-label="Close navigation"
-          onClick={() => setMobileOpen(false)}
+  if (currentUser.mustChangePassword) {
+    return (
+      <div className="ws-shell" style={brandStyle}>
+        <ForcedPasswordChange
+          api={tenantApi}
+          workspaceName={tenantInfo.name}
+          displayName={currentUser.displayName}
+          minLength={passwordMinLength}
+          onLogout={handleLogout}
+          onChanged={() => {
+            setToast('Password changed. Welcome!')
+            setCurrentUser({ ...currentUser, mustChangePassword: false })
+          }}
         />
-      )}
+      </div>
+    )
+  }
 
-      {/* Sidebar */}
-      <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
-        <div className="brand">
-          <span
-            className="brand-mark"
-            style={{ background: tenantInfo.primaryColor, color: '#fff' }}
-          >
-            <ShieldCheck size={18} />
-          </span>
-          <span className="brand-copy">
-            <span className="brand-name">{tenantInfo.name.split(' ')[0]}</span>
-            <span className="brand-product">Workspace</span>
-          </span>
+  // ==========================================
+  // WORKSPACE
+  // ==========================================
+  const nav: { id: NavId; label: string; icon: typeof Home; show: boolean; count?: number }[] = [
+    { id: 'Overview', label: 'Welcome', icon: Home, show: true },
+    { id: 'Members', label: 'Users', icon: Users, show: can.members, count: members.length || undefined },
+    { id: 'Teams', label: 'Departments & groups', icon: Building2, show: can.members, count: teams.length || undefined },
+    { id: 'Files', label: 'Files', icon: FileText, show: true },
+    { id: 'Audit', label: 'Audit trail', icon: FileClock, show: can.audit },
+    { id: 'Settings', label: 'Settings', icon: Settings, show: can.settings },
+  ]
+  const visibleNav = nav.filter((n) => n.show)
+  const current = visibleNav.find((n) => n.id === activeNav) ?? visibleNav[0]!
+  const go = (id: NavId) => {
+    setActiveNav(id)
+    setMobileOpen(false)
+  }
+  const firstName = currentUser.displayName.split(' ')[0]
+  const roleCounts = ROLES.map((r) => ({ role: r, count: members.filter((m) => m.role === r).length }))
+
+  return (
+    <div className="ws-shell" style={brandStyle}>
+      {mobileOpen && <button className="ws-nav-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}
+
+      <aside className={`ws-sidebar ${mobileOpen ? 'open' : ''}`}>
+        <div className="ws-side-brand">
+          <BrandMark info={tenantInfo} size={36} />
+          <span>{tenantInfo.name}</span>
         </div>
 
-        {/* Current User Context */}
-        <div style={{ padding: '14px', borderBottom: '1px solid var(--sidebar-border)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', overflow: 'hidden' }}>
-              <div
-                style={{
-                  width: '34px',
-                  height: '34px',
-                  borderRadius: '50%',
-                  background: roleBadges[currentUser?.role || 'user']?.bg,
-                  color: roleBadges[currentUser?.role || 'user']?.color,
-                  display: 'grid',
-                  placeItems: 'center',
-                  fontWeight: 700,
-                  fontSize: '12px',
-                  flexShrink: 0,
-                }}
+        <nav className="ws-nav" aria-label="Workspace">
+          {visibleNav.map((item) => {
+            const Icon = item.icon
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className="ws-nav-item"
+                aria-current={current.id === item.id ? 'page' : undefined}
+                onClick={() => go(item.id)}
               >
-                {currentUser?.displayName.split(' ').map((n) => n[0]).join('').slice(0, 2) || 'AD'}
-              </div>
-              <div style={{ overflow: 'hidden' }}>
-                <div style={{ fontWeight: 600, fontSize: '13px', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
-                  {currentUser?.displayName}
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--muted)' }}>
-                  {tenantInfo.domain}
-                </div>
-              </div>
-            </div>
-            <span
-              style={{
-                fontSize: '10px',
-                fontWeight: 700,
-                padding: '2px 6px',
-                borderRadius: '10px',
-                background: roleBadges[currentUser?.role || 'user']?.bg,
-                color: roleBadges[currentUser?.role || 'user']?.color,
-                textTransform: 'uppercase',
-              }}
-            >
-              {currentUser?.role}
-            </span>
-          </div>
-        </div>
-
-        <nav className="sidebar-nav">
-          <button
-            className={`nav-item ${activeNav === 'Overview' ? 'active' : ''}`}
-            onClick={() => setActiveNav('Overview')}
-          >
-            <CircleGauge size={18} />
-            <span>Workspace Overview</span>
-          </button>
-          <button
-            className={`nav-item ${activeNav === 'Members' ? 'active' : ''}`}
-            onClick={() => setActiveNav('Members')}
-          >
-            <Users size={18} />
-            <span>People & Teams</span>
-            <span className="nav-count">{members.length}</span>
-          </button>
-          <button
-            className={`nav-item ${activeNav === 'RBAC' ? 'active' : ''}`}
-            onClick={() => setActiveNav('RBAC')}
-          >
-            <KeyRound size={18} />
-            <span>Roles & Permissions</span>
-          </button>
-          <button
-            className={`nav-item ${activeNav === 'Audit' ? 'active' : ''}`}
-            onClick={() => setActiveNav('Audit')}
-          >
-            <FileClock size={18} />
-            <span>Audit Trail</span>
-          </button>
-          <button
-            className={`nav-item ${activeNav === 'Files' ? 'active' : ''}`}
-            onClick={() => setActiveNav('Files')}
-          >
-            <FileText size={18} />
-            <span>Files</span>
-          </button>
-          <button
-            className={`nav-item ${activeNav === 'Settings' ? 'active' : ''}`}
-            onClick={() => setActiveNav('Settings')}
-          >
-            <Settings size={18} />
-            <span>Tenant Settings</span>
-          </button>
+                <Icon size={18} />
+                <span>{item.label}</span>
+                {item.count !== undefined && <em>{item.count}</em>}
+              </button>
+            )
+          })}
         </nav>
 
-        <div style={{ padding: '14px', margin: 'auto 12px 12px', background: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#0369a1', fontWeight: 600, fontSize: '12px', marginBottom: '4px' }}>
-            <ShieldCheck size={14} />
-            <span>Schema Isolation Active</span>
+        <div className="ws-side-foot">
+          <div className="ws-me">
+            <span className="ws-avatar">{initialsOf(currentUser.displayName)}</span>
+            <div>
+              <strong>{currentUser.displayName}</strong>
+              <span>{ROLE_INFO[role].label}</span>
+            </div>
+            <button type="button" className="ws-icon-btn dark" onClick={() => setPasswordOpen(true)} aria-label="Change password" title="Change password">
+              <KeyRound size={17} />
+            </button>
+            <button type="button" className="ws-icon-btn dark" onClick={handleLogout} aria-label="Sign out" title="Sign out">
+              <LogOut size={17} />
+            </button>
           </div>
-          <p style={{ fontSize: '11px', color: '#64748b', margin: 0, lineHeight: 1.4 }}>
-            Database access is restricted to this hostname's immutable tenant identity.
-          </p>
         </div>
       </aside>
 
-      {/* Main Wrapper */}
-      <div className="main-wrapper">
-        <header className="topbar">
-          <button
-            className="icon-button mobile-menu"
-            aria-label="Open navigation menu"
-            onClick={() => setMobileOpen(true)}
-          >
+      <div className="ws-main">
+        <header className="ws-topbar">
+          <button className="ws-icon-btn ws-menu" aria-label="Open navigation" onClick={() => setMobileOpen(true)}>
             <Menu size={20} />
           </button>
-
-          <div className="search-box">
-            <Search size={16} />
-            <input
-              type="search"
-              placeholder={`Search ${tenantInfo.name} directory, roles, audit logs...`}
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-          </div>
-
-          <div className="topbar-actions">
-            <button
-              className="primary-button"
-              onClick={() => setInviteDialogOpen(true)}
-              style={{ display: 'flex', alignItems: 'center', gap: '6px', background: tenantInfo.primaryColor }}
-            >
-              <UserPlus size={16} />
-              <span>Invite Member</span>
-            </button>
-
-            <button
-              className="secondary-button"
-              onClick={handleLogout}
-              title="Sign Out of Tenant"
-              style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#dc2626' }}
-            >
-              <LogOut size={16} />
-              <span>Log Out</span>
-            </button>
+          <h1>{current.id === 'Overview' ? tenantInfo.name : current.label}</h1>
+          <div className="ws-topbar-actions">
+            {current.id === 'Members' && can.settings && (
+              <>
+                <button type="button" className="ws-btn ghost" onClick={() => setDefaultPasswordOpen(true)}>
+                  <KeyRound size={16} />
+                  <span>Default password</span>
+                </button>
+                <button type="button" className="ws-btn ghost" onClick={() => setCategoriesOpen(true)}>
+                  <Tags size={16} />
+                  <span>Categories</span>
+                </button>
+              </>
+            )}
+            {current.id === 'Members' && can.invite && (
+              <>
+                <button type="button" className="ws-btn ghost" onClick={() => setImportOpen(true)}>
+                  <Upload size={16} />
+                  <span>Import CSV</span>
+                </button>
+                <button type="button" className="ws-btn ghost" onClick={() => setInviteDialogOpen(true)}>
+                  <UserCheck size={16} />
+                  <span>Invite</span>
+                </button>
+                <button type="button" className="ws-btn primary" onClick={() => setAddUserOpen(true)}>
+                  <UserPlus size={16} />
+                  <span>Add user</span>
+                </button>
+              </>
+            )}
+            {current.id === 'Teams' && can.editRoles && (
+              <button type="button" className="ws-btn primary" onClick={() => setTeamEdit('new')}>
+                <Building2 size={16} />
+                <span>Add department or group</span>
+              </button>
+            )}
+            {(current.id === 'Members' || current.id === 'Audit') && (
+              <button type="button" className="ws-icon-btn" onClick={() => loadTenantData()} aria-label="Refresh" title="Refresh">
+                <RefreshCw size={16} className={isLoadingData ? 'spin' : ''} />
+              </button>
+            )}
           </div>
         </header>
 
-        <main className="main-content">
-          <div className="content-width">
-          {toast && (
-            <div
-              style={{
-                position: 'fixed',
-                bottom: '24px',
-                right: '24px',
-                background: '#1e293b',
-                color: '#fff',
-                padding: '12px 20px',
-                borderRadius: '8px',
-                boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
-                zIndex: 1000,
-                display: 'flex',
-                alignItems: 'center',
-                gap: '10px',
-                fontSize: '13px',
-                fontWeight: 500,
-              }}
-            >
-              <Check size={16} color="#4ade80" />
-              <span>{toast}</span>
-            </div>
-          )}
+        <main className="ws-content">
+          {/* OVERVIEW */}
+          {current.id === 'Overview' && (
+            <div className="ws-stack">
+              <section className="ws-hero">
+                <span className="ws-eyebrow">
+                  {new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })}
+                </span>
+                <h2>
+                  Welcome to {tenantInfo.name}, <em>{firstName}.</em>
+                </h2>
+                <p>{tenantInfo.description || tenantInfo.loginMessage || 'Your workspace: people, files and the modules your organisation uses, in one place.'}</p>
+              </section>
 
-          {/* VIEW 1: OVERVIEW */}
-          {activeNav === 'Overview' && (
-            <div>
-              <div
-                className="welcome-band"
-                style={{
-                  background: '#f8fafc',
-                  borderColor: tenantInfo.primaryColor,
-                  color: tenantInfo.accentColor,
-                }}
-              >
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                    <span
-                      style={{
-                        fontSize: '10px',
-                        fontWeight: 700,
-                        padding: '3px 8px',
-                        borderRadius: '4px',
-                        background: tenantInfo.primaryColor,
-                        color: '#fff',
-                      }}
-                    >
-                      B2B TENANT WORKSPACE
-                    </span>
-                    <span style={{ fontSize: '12px', color: '#64748b' }}>Domain: {tenantInfo.domain}</span>
+              {(can.invite || can.settings) && (
+                <section className="ws-card">
+                  <header className="ws-card-head">
+                    <h3>Get started</h3>
+                  </header>
+                  <div className="ws-shortcuts">
+                    {can.invite && (
+                      <button type="button" onClick={() => setInviteDialogOpen(true)}>
+                        <UserPlus size={18} /> {members.length > 1 ? 'Invite more people' : 'Invite your team'} <ArrowRight size={14} />
+                      </button>
+                    )}
+                    {can.editRoles && (
+                      <button type="button" onClick={() => go('Members')}>
+                        <Users size={18} /> Assign roles and categories <ArrowRight size={14} />
+                      </button>
+                    )}
+                    {can.settings && (
+                      <button type="button" onClick={() => go('Settings')}>
+                        <Settings size={18} /> Review workspace settings <ArrowRight size={14} />
+                      </button>
+                    )}
+                    <button type="button" onClick={() => go('Files')}>
+                      <FileText size={18} /> Upload shared files <ArrowRight size={14} />
+                    </button>
                   </div>
-                  <h2>{tenantInfo.name}</h2>
-                  <p style={{ color: '#475569' }}>
-                    {tenantInfo.description}. PostgreSQL access is bound to this tenant's dedicated runtime identity.
-                  </p>
-                </div>
-                <div style={{ display: 'flex', gap: '10px' }}>
-                  <button
-                    onClick={() => setInviteDialogOpen(true)}
-                    style={{
-                      padding: '10px 18px',
-                      background: tenantInfo.primaryColor,
-                      color: '#fff',
-                      borderRadius: '6px',
-                      border: 'none',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '8px',
-                    }}
-                  >
-                    <UserPlus size={16} />
-                    <span>Invite Team Member</span>
-                  </button>
-                </div>
-              </div>
+                </section>
+              )}
 
-              <div className="metric-grid">
-                <MetricCard
-                  label="Total Tenant Users"
-                  value={String(members.length)}
-                  foot={<span>Current tenant members</span>}
-                  icon={<Users size={20} />}
-                />
-                <MetricCard
-                  label="Tenant Identity"
-                  value={tenantInfo.tenantId}
-                  foot={<span>Immutable and hostname-bound</span>}
-                  icon={<Database size={20} />}
-                />
-                <MetricCard
-                  label="Tenant Plan"
-                  value={tenantInfo.planName.split(' ')[0] || 'Enterprise'}
-                  foot={<span>{tenantInfo.planName}</span>}
-                  icon={<Building2 size={20} />}
-                />
-                <MetricCard
-                  label="Security Health"
-                  value="100%"
-                  foot={<span>0 cross-tenant permissions</span>}
-                  icon={<ShieldCheck size={20} />}
-                />
-              </div>
-
-              {/* Roles Breakdown */}
-              <div style={{ marginTop: '28px' }}>
-                <h3 style={{ margin: '0 0 16px 0', fontSize: '17px', fontWeight: 600 }}>Role Distribution ({members.length} Users)</h3>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px' }}>
-                  {(['admin', 'manager', 'user', 'guest'] as const).map((r) => {
-                    const count = members.filter((m) => m.role === r).length
-                    const badge = roleBadges[r]
-                    const Icon = badge.icon
-                    return (
-                      <div
-                        key={r}
-                        style={{
-                          background: '#fff',
-                          borderRadius: '8px',
-                          border: '1px solid #e2e8f0',
-                          padding: '16px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '14px',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: '40px',
-                            height: '40px',
-                            borderRadius: '8px',
-                            background: badge.bg,
-                            color: badge.color,
-                            display: 'grid',
-                            placeItems: 'center',
-                          }}
-                        >
-                          <Icon size={20} />
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '20px', fontWeight: 800, color: '#1e293b' }}>{count}</div>
-                          <div style={{ fontSize: '12px', color: '#64748b', fontWeight: 500, textTransform: 'capitalize' }}>
-                            {r} Accounts
-                          </div>
-                        </div>
+              <div className="ws-grid">
+                {can.members && (
+                  <section className="ws-card">
+                    <header className="ws-card-head">
+                      <h3>Team</h3>
+                      <button type="button" className="ws-link" onClick={() => go('Members')}>
+                        View users <ArrowRight size={14} />
+                      </button>
+                    </header>
+                    <div className="ws-team">
+                      <div className="ws-big">
+                        {members.length}
+                        <span>{members.length === 1 ? 'member' : 'members'}</span>
                       </div>
-                    )
-                  })}
-                </div>
-              </div>
-
-              {/* Members Quick Preview */}
-              <div style={{ marginTop: '28px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
-                  <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 600 }}>Active Members ({tenantInfo.name})</h3>
-                  <button
-                    onClick={() => setActiveNav('Members')}
-                    style={{ background: 'none', border: 'none', color: tenantInfo.primaryColor, fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}
-                  >
-                    View all {members.length} users &rarr;
-                  </button>
-                </div>
-
-                <div className="table-wrapper">
-                  <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
-                    <thead>
-                      <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
-                        <th style={{ padding: '10px 16px' }}>User</th>
-                        <th style={{ padding: '10px 16px' }}>Email</th>
-                        <th style={{ padding: '10px 16px' }}>Assigned Role</th>
-                        <th style={{ padding: '10px 16px' }}>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {members.slice(0, 5).map((m) => (
-                        <tr key={m.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{ padding: '10px 16px', fontWeight: 600, color: '#1e293b' }}>{m.displayName}</td>
-                          <td style={{ padding: '10px 16px', color: '#64748b' }}>{m.email}</td>
-                          <td style={{ padding: '10px 16px' }}>
-                            <span
-                              style={{
-                                fontSize: '10px',
-                                fontWeight: 700,
-                                padding: '2px 8px',
-                                borderRadius: '10px',
-                                background: roleBadges[m.role]?.bg,
-                                color: roleBadges[m.role]?.color,
-                                textTransform: 'uppercase',
-                              }}
-                            >
-                              {m.role}
-                            </span>
-                          </td>
-                          <td style={{ padding: '10px 16px', color: '#16a34a', fontWeight: 500 }}>Active</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* VIEW 2: MEMBERS */}
-          {activeNav === 'Members' && (
-            <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                <div>
-                  <h2 style={{ margin: '0 0 4px 0', fontSize: '22px', fontWeight: 700 }}>
-                    {tenantInfo.name} Directory ({members.length})
-                  </h2>
-                  <p style={{ margin: 0, color: 'var(--muted)', fontSize: '13px' }}>
-                    Members available within this isolated enterprise workspace.
-                  </p>
-                </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button
-                    onClick={() => loadTenantData()}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      padding: '8px 14px',
-                      background: '#fff',
-                      border: '1px solid #cbd5e1',
-                      borderRadius: '6px',
-                      cursor: 'pointer',
-                      fontSize: '13px',
-                    }}
-                  >
-                    <RefreshCw size={14} className={isLoadingData ? 'spin' : ''} />
-                    <span>Refresh</span>
-                  </button>
-                  <button
-                    className="primary-button"
-                    onClick={() => setInviteDialogOpen(true)}
-                    style={{ display: 'flex', alignItems: 'center', gap: '6px', background: tenantInfo.primaryColor }}
-                  >
-                    <UserPlus size={16} />
-                    <span>Invite Member</span>
-                  </button>
-                </div>
-              </div>
-
-              <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>
-                <button
-                  onClick={() => setRoleFilter('')}
-                  style={{
-                    padding: '6px 14px',
-                    borderRadius: '20px',
-                    border: '1px solid',
-                    borderColor: roleFilter === '' ? tenantInfo.primaryColor : '#e2e8f0',
-                    background: roleFilter === '' ? tenantInfo.primaryColor : '#fff',
-                    color: roleFilter === '' ? '#fff' : '#64748b',
-                    fontSize: '12px',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  All Roles ({members.length})
-                </button>
-                {(['admin', 'manager', 'user', 'guest'] as const).map((r) => (
-                  <button
-                    key={r}
-                    onClick={() => setRoleFilter(r)}
-                    style={{
-                      padding: '6px 14px',
-                      borderRadius: '20px',
-                      border: '1px solid',
-                      borderColor: roleFilter === r ? roleBadges[r]?.color : '#e2e8f0',
-                      background: roleFilter === r ? roleBadges[r]?.bg : '#fff',
-                      color: roleFilter === r ? roleBadges[r]?.color : '#64748b',
-                      fontSize: '12px',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      textTransform: 'uppercase',
-                    }}
-                  >
-                    {r} ({members.filter((m) => m.role === r).length})
-                  </button>
-                ))}
-              </div>
-
-              <div className="table-wrapper">
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
-                  <thead>
-                    <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
-                      <th style={{ padding: '12px 16px' }}>User & Identity</th>
-                      <th style={{ padding: '12px 16px' }}>Email Address</th>
-                      <th style={{ padding: '12px 16px' }}>Assigned Role</th>
-                      <th style={{ padding: '12px 16px' }}>Status</th>
-                      <th style={{ padding: '12px 16px', textAlign: 'right' }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredMembers.map((user) => {
-                      const badge = roleBadges[user.role] || roleBadges.user!
-                      const Icon = badge.icon
-                      return (
-                        <tr key={user.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{ padding: '12px 16px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                              <div
-                                style={{
-                                  width: '32px',
-                                  height: '32px',
-                                  borderRadius: '50%',
-                                  background: badge.bg,
-                                  color: badge.color,
-                                  display: 'grid',
-                                  placeItems: 'center',
-                                  fontWeight: 700,
-                                  fontSize: '12px',
-                                }}
-                              >
-                                {user.displayName.split(' ').map((n) => n[0]).join('').slice(0, 2)}
-                              </div>
-                              <div>
-                                <div style={{ fontWeight: 600, color: '#1e293b' }}>{user.displayName}</div>
-                                <div style={{ fontSize: '11px', color: '#94a3b8' }}>@{user.username}</div>
-                              </div>
-                            </div>
-                          </td>
-                          <td style={{ padding: '12px 16px', color: '#64748b' }}>{user.email}</td>
-                          <td style={{ padding: '12px 16px' }}>
-                            <span
-                              style={{
-                                display: 'inline-flex',
-                                alignItems: 'center',
-                                gap: '4px',
-                                padding: '3px 9px',
-                                borderRadius: '12px',
-                                background: badge.bg,
-                                color: badge.color,
-                                fontWeight: 700,
-                                fontSize: '11px',
-                                textTransform: 'uppercase',
-                              }}
-                            >
-                              <Icon size={12} />
-                              <span>{user.role}</span>
-                            </span>
-                          </td>
-                          <td style={{ padding: '12px 16px' }}>
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: '#16a34a', fontSize: '12px', fontWeight: 500 }}>
-                              <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#16a34a' }} />
-                              <span>Active</span>
-                            </span>
-                          </td>
-                          <td style={{ padding: '12px 16px', textAlign: 'right' }}>
-                            <button
-                              onClick={() => setEditRoleUser(user)}
-                              style={{
-                                padding: '5px 12px',
-                                background: '#f1f5f9',
-                                color: '#334155',
-                                border: '1px solid #cbd5e1',
-                                borderRadius: '5px',
-                                fontSize: '12px',
-                                fontWeight: 600,
-                                cursor: 'pointer',
-                              }}
-                            >
-                              Edit Role
-                            </button>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {/* VIEW 3: RBAC */}
-          {activeNav === 'RBAC' && (
-            <div>
-              <h2 style={{ fontSize: '22px', fontWeight: 700, margin: '0 0 8px 0' }}>Role-Based Access Control (RBAC)</h2>
-              <p style={{ color: 'var(--muted)', fontSize: '13px', margin: '0 0 24px 0' }}>
-                Permissions are evaluated inside this tenant's isolated database boundary.
-              </p>
-
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
-                {(['admin', 'manager', 'user', 'guest'] as const).map((r) => {
-                  const badge = roleBadges[r]
-                  const Icon = badge.icon
-                  return (
-                    <div
-                      key={r}
-                      style={{
-                        background: '#fff',
-                        borderRadius: '10px',
-                        border: '1px solid #e2e8f0',
-                        padding: '20px',
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
-                        <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: badge.bg, color: badge.color, display: 'grid', placeItems: 'center' }}>
-                          <Icon size={18} />
-                        </div>
-                        <div>
-                          <div style={{ fontWeight: 700, fontSize: '15px', textTransform: 'capitalize' }}>{r}</div>
-                          <div style={{ fontSize: '11px', color: '#64748b' }}>{members.filter((m) => m.role === r).length} active members</div>
-                        </div>
-                      </div>
-
-                      <div style={{ borderTop: '1px solid #f1f5f9', paddingTop: '12px', fontSize: '12px', color: '#475569', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        <div><strong>Permissions:</strong></div>
-                        {r === 'admin' && (
-                          <>
-                            <div>&bull; Full tenant governance & provisioning</div>
-                            <div>&bull; Role assignment & member management</div>
-                            <div>&bull; Audit log inspection & exports</div>
-                            <div>&bull; Security & API key configuration</div>
-                          </>
-                        )}
-                        {r === 'manager' && (
-                          <>
-                            <div>&bull; Team workspace orchestration</div>
-                            <div>&bull; Member invites & team allocation</div>
-                            <div>&bull; Read-only audit log access</div>
-                          </>
-                        )}
-                        {r === 'user' && (
-                          <>
-                            <div>&bull; Full access to tenant business tools</div>
-                            <div>&bull; Project creation & collaboration</div>
-                            <div>&bull; Personal profile settings</div>
-                          </>
-                        )}
-                        {r === 'guest' && (
-                          <>
-                            <div>&bull; Restricted view-only access</div>
-                            <div>&bull; Shared reports & dashboards view</div>
-                          </>
-                        )}
+                      <div className="ws-faces">
+                        {members.slice(0, 4).map((m) => (
+                          <span key={m.id} className="ws-avatar sm" title={m.displayName}>
+                            {initialsOf(m.displayName)}
+                          </span>
+                        ))}
+                        {members.length > 4 && <span className="ws-avatar sm more">+{members.length - 4}</span>}
                       </div>
                     </div>
-                  )
-                })}
+                    <ul className="ws-roles-list">
+                      {roleCounts
+                        .filter((r) => r.count > 0)
+                        .map((r) => (
+                          <li key={r.role}>
+                            <RolePill role={r.role} />
+                            <span className="ws-bar">
+                              <i style={{ width: `${(r.count / Math.max(1, members.length)) * 100}%` }} />
+                            </span>
+                            <b>{r.count}</b>
+                          </li>
+                        ))}
+                    </ul>
+                    {can.invite && (
+                      <button type="button" className="ws-btn subtle block" onClick={() => setInviteDialogOpen(true)}>
+                        <UserPlus size={16} /> Invite someone
+                      </button>
+                    )}
+                  </section>
+                )}
+
+                {can.audit && (
+                  <section className="ws-card">
+                    <header className="ws-card-head">
+                      <h3>Recent activity</h3>
+                      <button type="button" className="ws-link" onClick={() => go('Audit')}>
+                        Audit trail <ArrowRight size={14} />
+                      </button>
+                    </header>
+                    {auditLogs.length === 0 ? (
+                      <p className="ws-empty-line">No activity recorded yet.</p>
+                    ) : (
+                      <ul className="ws-activity">
+                        {auditLogs.slice(0, 6).map((log) => (
+                          <li key={log.id}>
+                            <span className="ws-avatar sm">{initialsOf(log.actor || '?')}</span>
+                            <div>
+                              <strong>{log.actor}</strong> <span>{humanAction(log.action).toLowerCase()}</span>
+                              <time>{relativeTime(log.occurredAt)}</time>
+                            </div>
+                            {log.outcome !== 'success' && <span className="ws-outcome" data-outcome={log.outcome}>{log.outcome}</span>}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                )}
+
+                {!can.audit && (
+                  <section className="ws-card">
+                    <header className="ws-card-head">
+                      <h3>Shortcuts</h3>
+                    </header>
+                    <div className="ws-shortcuts">
+                      <button type="button" onClick={() => go('Files')}>
+                        <FileText size={18} /> Files <ArrowRight size={14} />
+                      </button>
+                      {can.members && (
+                        <button type="button" onClick={() => go('Members')}>
+                          <Users size={18} /> Users <ArrowRight size={14} />
+                        </button>
+                      )}
+                    </div>
+                  </section>
+                )}
               </div>
             </div>
           )}
 
-          {/* VIEW 4: AUDIT */}
-          {activeNav === 'Audit' && (
-            <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-                <div>
-                  <h2 style={{ fontSize: '22px', fontWeight: 700, margin: '0 0 4px 0' }}>Security Audit Trail</h2>
-                  <p style={{ color: 'var(--muted)', fontSize: '13px', margin: 0 }}>
-                    Immutable event records for this tenant workspace.
-                  </p>
+          {/* PEOPLE */}
+          {current.id === 'Members' && (
+            <div className="ws-stack">
+              <div className="ws-toolbar">
+                <label className="ws-search">
+                  <Search size={16} />
+                  <input type="search" placeholder="Search users" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search users" />
+                </label>
+                <div className="ws-chips" role="group" aria-label="Filter by role">
+                  <button type="button" aria-pressed={roleFilter === ''} onClick={() => setRoleFilter('')}>
+                    All <em>{members.length}</em>
+                  </button>
+                  {roleCounts
+                    .filter((r) => r.count > 0)
+                    .map((r) => (
+                      <button key={r.role} type="button" aria-pressed={roleFilter === r.role} onClick={() => setRoleFilter(r.role)}>
+                        {ROLE_INFO[r.role].label} <em>{r.count}</em>
+                      </button>
+                    ))}
                 </div>
-                <button
-                  onClick={() => loadTenantData()}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    padding: '8px 14px',
-                    background: '#fff',
-                    border: '1px solid #cbd5e1',
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    fontSize: '13px',
-                  }}
-                >
-                  <RefreshCw size={14} className={isLoadingData ? 'spin' : ''} />
-                  <span>Refresh Trail</span>
-                </button>
               </div>
 
-              <div className="table-wrapper">
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
+              <div className="ws-table-card">
+                <table className="ws-table">
                   <thead>
-                    <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
-                      <th style={{ padding: '12px 16px' }}>Timestamp</th>
-                      <th style={{ padding: '12px 16px' }}>Actor</th>
-                      <th style={{ padding: '12px 16px' }}>Action</th>
-                      <th style={{ padding: '12px 16px' }}>Resource</th>
-                      <th style={{ padding: '12px 16px' }}>Outcome</th>
+                    <tr>
+                      <th>Name</th>
+                      <th>Email</th>
+                      <th>Role</th>
+                      <th>Category</th>
+                      {can.editRoles && <th aria-label="Actions" />}
                     </tr>
                   </thead>
                   <tbody>
-                    {auditLogs.length === 0 ? (
+                    {filteredMembers.length === 0 ? (
                       <tr>
-                        <td colSpan={5} style={{ padding: '24px', textAlign: 'center', color: '#94a3b8' }}>
-                          No audit events recorded yet for this session.
+                        <td colSpan={5} className="ws-empty-cell">
+                          {members.length === 0 ? 'No users yet.' : 'Nobody matches this search.'}
                         </td>
                       </tr>
                     ) : (
-                      auditLogs.map((log) => (
-                        <tr key={log.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{ padding: '12px 16px', color: '#64748b', fontSize: '12px' }}>
-                            {new Date(log.occurredAt).toLocaleString()}
+                      filteredMembers.map((user) => (
+                        <tr key={user.id}>
+                          <td>
+                            <div className="ws-person">
+                              <span className="ws-avatar sm">{initialsOf(user.displayName)}</span>
+                              <div>
+                                <strong>{user.displayName}</strong>
+                                {user.status && user.status !== 'active' && <span className="ws-status">{user.status}</span>}
+                                {user.passwordChangeRequired && <span className="ws-status">must change password</span>}
+                              </div>
+                            </div>
                           </td>
-                          <td style={{ padding: '12px 16px', fontWeight: 600, color: '#1e293b' }}>{log.actor}</td>
-                          <td style={{ padding: '12px 16px', fontFamily: 'monospace', color: '#0369a1' }}>{log.action}</td>
-                          <td style={{ padding: '12px 16px', color: '#64748b' }}>{log.resourceType}</td>
-                          <td style={{ padding: '12px 16px' }}>
-                            <span
-                              style={{
-                                fontSize: '11px',
-                                fontWeight: 700,
-                                padding: '2px 8px',
-                                borderRadius: '10px',
-                                background: log.outcome === 'success' ? '#dcfce7' : '#fee2e2',
-                                color: log.outcome === 'success' ? '#15803d' : '#b91c1c',
-                                textTransform: 'uppercase',
-                              }}
-                            >
-                              {log.outcome}
-                            </span>
+                          <td className="ws-muted" data-label="Email">{user.email}</td>
+                          <td data-label="Role">
+                            <RolePill role={user.role} />
                           </td>
+                          <td data-label="Category">
+                            {can.editRoles && (role !== 'manager' || ['user', 'guest'].includes(user.role)) ? (
+                              <select
+                                className="ws-cell-select"
+                                value={user.category?.id ?? ''}
+                                onChange={(e) => void handleCategoryChange(user.id, e.target.value || null)}
+                                aria-label={`Category for ${user.displayName}`}
+                              >
+                                <option value="">None</option>
+                                {categories.map((category) => (
+                                  <option key={category.id} value={category.id}>{category.name}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="ws-muted">{user.category?.name ?? '—'}</span>
+                            )}
+                          </td>
+                          {can.editRoles && (
+                            <td className="ws-right">
+                              {user.id !== currentUser.id && (role !== 'manager' || ['user','guest'].includes(user.role)) && (
+                                <span className="ws-row-actions">
+                                  <button type="button" className="ws-btn ghost sm" onClick={() => setEditRoleUser(user)}>
+                                    Change role
+                                  </button>
+                                  {user.status !== 'suspended' && (
+                                    <button type="button" className="ws-btn ghost sm" onClick={() => void handleResetPassword(user)}>
+                                      Reset password
+                                    </button>
+                                  )}
+                                </span>
+                              )}
+                            </td>
+                          )}
                         </tr>
                       ))
                     )}
@@ -1193,353 +1086,290 @@ export default function App() {
             </div>
           )}
 
-          {/* VIEW 5: SETTINGS */}
-          {activeNav === 'Files' && <FilesPage csrfToken={csrfToken} accent={tenantInfo.primaryColor} />}
+          {/* DEPARTMENTS & GROUPS */}
+          {current.id === 'Teams' && (
+            <TeamsPage
+              api={tenantApi}
+              teams={teams}
+              loaded={teamsLoaded}
+              members={members}
+              managerOnly={role === 'manager'}
+              onChanged={() => void reloadTeams()}
+              onEdit={(team) => setTeamEdit(team)}
+              onToast={setToast}
+            />
+          )}
 
-          {activeNav === 'Settings' && (
-            <div style={{ maxWidth: '640px' }}>
-              <h2 style={{ fontSize: '22px', fontWeight: 700, margin: '0 0 16px 0' }}>Tenant Settings</h2>
-              
-              <div style={{ background: '#fff', padding: '24px', borderRadius: '8px', border: '1px solid #e2e8f0', marginBottom: '20px' }}>
-                <h4 style={{ margin: '0 0 16px 0', fontSize: '15px' }}>Tenant Identity & Schema</h4>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          {/* AUDIT */}
+          {current.id === 'Audit' && (
+            <div className="ws-table-card">
+              <table className="ws-table">
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Who</th>
+                    <th>What</th>
+                    <th>Outcome</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {auditLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="ws-empty-cell">
+                        No activity recorded yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    auditLogs.map((log) => (
+                      <tr key={log.id}>
+                        <td className="ws-muted ws-nowrap" data-label="When" title={new Date(log.occurredAt).toLocaleString()}>
+                          {relativeTime(log.occurredAt)}
+                        </td>
+                        <td data-label="Who">
+                          <strong>{log.actor}</strong>
+                        </td>
+                        <td data-label="What">
+                          {humanAction(log.action)}
+                          {log.resourceType && <span className="ws-muted"> · {log.resourceType}</span>}
+                        </td>
+                        <td data-label="Outcome">
+                          <span className="ws-outcome" data-outcome={log.outcome}>
+                            {log.outcome}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* FILES */}
+          {current.id === 'Files' && <FilesPage csrfToken={csrfToken} accent={tenantInfo.primaryColor} />}
+
+          {/* SETTINGS */}
+          {current.id === 'Settings' && (
+            <div className="ws-stack ws-narrow">
+              <section className="ws-card">
+                <header className="ws-card-head">
+                  <h3>Workspace</h3>
+                </header>
+                <dl className="ws-dl">
                   <div>
-                    <label htmlFor="tenant-settings-name" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Tenant Name</label>
-                    <input
-                      id="tenant-settings-name"
-                      type="text"
-                      readOnly
-                      value={tenantInfo.name}
-                      style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1', background: '#f8fafc' }}
-                    />
+                    <dt>Name</dt>
+                    <dd>{tenantInfo.name}</dd>
                   </div>
                   <div>
-                    <label htmlFor="tenant-settings-domain" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Bound Host Domain</label>
-                    <input
-                      id="tenant-settings-domain"
-                      type="text"
-                      readOnly
-                      value={tenantInfo.domain}
-                      style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1', background: '#f8fafc' }}
-                    />
+                    <dt>Web address</dt>
+                    <dd>{tenantInfo.domain}</dd>
                   </div>
-                  <div>
-                    <label htmlFor="tenant-settings-id" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Immutable Tenant Identity</label>
-                    <input
-                      id="tenant-settings-id"
-                      type="text"
-                      readOnly
-                      value={tenantInfo.tenantId}
-                      style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1', background: '#f8fafc' }}
-                    />
-                  </div>
-                </div>
-              </div>
+                </dl>
+              </section>
               <WorkspaceSettings csrfToken={csrfToken} accent={tenantInfo.primaryColor} />
               <IntegrationsSettings csrfToken={csrfToken} accent={tenantInfo.primaryColor} />
             </div>
           )}
-          </div>
         </main>
       </div>
 
+      {toast && (
+        <div className="ws-toast" role="status">
+          <Check size={16} />
+          <span>{toast}</span>
+        </div>
+      )}
+
       {/* ONE-TIME INVITATION LINK */}
       {inviteResult && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'grid', placeItems: 'center', zIndex: 1001 }}>
-          <div style={{ background: '#fff', padding: '24px', borderRadius: '8px', width: '100%', maxWidth: '520px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            <h3 style={{ margin: 0, fontSize: '17px' }}>Invitation for {inviteResult.name}</h3>
-            <p style={{ margin: 0, fontSize: '13px', color: '#475569' }}>
-              {inviteResult.delivered
-                ? 'An invitation was sent. You can also share this link directly.'
-                : 'Share this link with them securely. It works once and is shown only now.'}
-            </p>
-            <code style={{ padding: '10px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '6px', fontSize: '12px', overflowWrap: 'anywhere' }}>{inviteResult.link}</code>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-              <button onClick={() => void navigator.clipboard.writeText(inviteResult.link).then(() => setToast('Invitation link copied'))} style={{ padding: '8px 14px', border: '1px solid #cbd5e1', borderRadius: '6px', background: '#fff', cursor: 'pointer' }}>Copy link</button>
-              <button onClick={() => setInviteResult(null)} style={{ padding: '8px 14px', border: 0, borderRadius: '6px', background: tenantInfo.primaryColor, color: '#fff', cursor: 'pointer' }}>Done</button>
-            </div>
-          </div>
-        </div>
+        <Modal
+          title={`Invitation for ${inviteResult.name}`}
+          onClose={() => setInviteResult(null)}
+          footer={
+            <>
+              <button
+                type="button"
+                className="ws-btn ghost"
+                onClick={() => void navigator.clipboard.writeText(inviteResult.link).then(() => setToast('Invitation link copied'))}
+              >
+                Copy link
+              </button>
+              <button type="button" className="ws-btn primary" onClick={() => setInviteResult(null)}>
+                Done
+              </button>
+            </>
+          }
+        >
+          <p className="ws-muted">
+            {inviteResult.delivered
+              ? 'An invitation email is on its way. You can also share this link directly.'
+              : 'Share this link with them privately. It works once and is shown only now.'}
+          </p>
+          <code className="ws-code">{inviteResult.link}</code>
+        </Modal>
       )}
 
-      {/* INVITE MODAL */}
+      {/* INVITE */}
       {inviteDialogOpen && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.5)',
-            display: 'grid',
-            placeItems: 'center',
-            zIndex: 1000,
-          }}
-        >
-          <div style={{ background: '#fff', padding: '24px', borderRadius: '8px', width: '100%', maxWidth: '440px', boxShadow: '0 20px 40px rgba(0,0,0,0.2)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-              <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700 }}>Invite to {tenantInfo.name}</h3>
-              <button onClick={() => setInviteDialogOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
-                <X size={18} />
+        <Modal title={`Invite to ${tenantInfo.name}`} onClose={() => setInviteDialogOpen(false)}>
+          <form onSubmit={handleInvite} className="ws-form">
+            <label className="ws-field">
+              <span>Full name</span>
+              <input id="tenant-invite-display-name" name="displayName" type="text" required autoComplete="off" />
+            </label>
+            <label className="ws-field">
+              <span>Email</span>
+              <input id="tenant-invite-email" name="email" type="email" required autoComplete="off" />
+            </label>
+            <label className="ws-field">
+              <span>Username</span>
+              <input id="tenant-invite-username" name="username" type="text" required autoComplete="off" autoCapitalize="none" spellCheck={false} />
+            </label>
+            <label className="ws-field">
+              <span>Role</span>
+              <select id="tenant-invite-role" name="role" defaultValue="user">
+                {assignableRoles.map((r) => (
+                  <option key={r} value={r}>
+                    {ROLE_INFO[r].label} — {ROLE_INFO[r].summary}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {categories.length > 0 && (
+              <label className="ws-field">
+                <span>Category</span>
+                <select name="categoryId" defaultValue="">
+                  <option value="">No category</option>
+                  {categories.map((category) => (
+                    <option key={category.id} value={category.id}>{category.name}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <div className="ws-modal-actions">
+              <button type="button" className="ws-btn ghost" onClick={() => setInviteDialogOpen(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="ws-btn primary">
+                Send invitation
               </button>
             </div>
-            <form onSubmit={handleInvite}>
-              <div style={{ marginBottom: '12px' }}>
-                <label htmlFor="tenant-invite-display-name" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Full Name</label>
-                <input
-                  id="tenant-invite-display-name"
-                  name="displayName"
-                  type="text"
-                  required
-                  placeholder="e.g. Clara Oswald"
-                  style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
-                />
-              </div>
-              <div style={{ marginBottom: '12px' }}>
-                <label htmlFor="tenant-invite-username" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Username</label>
-                <input
-                  id="tenant-invite-username"
-                  name="username"
-                  type="text"
-                  required
-                  placeholder="e.g. clara.oswald"
-                  style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
-                />
-              </div>
-              <div style={{ marginBottom: '12px' }}>
-                <label htmlFor="tenant-invite-email" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Corporate Email</label>
-                <input
-                  id="tenant-invite-email"
-                  name="email"
-                  type="email"
-                  required
-                  placeholder={`clara@${tenantInfo.slug || 'tenant'}.example`}
-                  style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
-                />
-              </div>
-              <div style={{ marginBottom: '20px' }}>
-                <label htmlFor="tenant-invite-role" style={{ fontSize: '12px', fontWeight: 600, color: '#475569' }}>Assigned Tenant Role</label>
-                <select
-                  id="tenant-invite-role"
-                  name="role"
-                  style={{ width: '100%', padding: '8px 12px', marginTop: '4px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
-                >
-                  <option value="user">User (Standard Access)</option>
-                  <option value="manager">Manager (Team Management)</option>
-                  <option value="admin">Admin (Full Control)</option>
-                  <option value="guest">Guest (Restricted View)</option>
-                </select>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  type="button"
-                  onClick={() => setInviteDialogOpen(false)}
-                  style={{ padding: '8px 16px', background: '#f1f5f9', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  style={{ padding: '8px 16px', background: tenantInfo.primaryColor, color: '#fff', border: 'none', borderRadius: '6px', fontWeight: 600, cursor: 'pointer', fontSize: '13px' }}
-                >
-                  Send Invitation
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+          </form>
+        </Modal>
       )}
 
-      {/* EDIT ROLE MODAL */}
-      {editRoleUser && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.5)',
-            display: 'grid',
-            placeItems: 'center',
-            zIndex: 1000,
+      {/* ADD USER */}
+      {addUserOpen && (
+        <Modal title={`Add a user to ${tenantInfo.name}`} onClose={() => setAddUserOpen(false)}>
+          <AddUserForm
+            api={tenantApi}
+            categories={categories}
+            canAddAdministrators={canAddAdministrators}
+            passwordMinLength={passwordMinLength}
+            allowInvitation={false}
+            defaultPasswordConfigured={defaultPassword.configured}
+            onCancel={() => setAddUserOpen(false)}
+            onCreated={(user) => {
+              setAddUserOpen(false)
+              setToast(`${user.displayName} added as ${user.kind === 'administrator' ? 'an administrator' : 'a user'}`)
+              void loadTenantData()
+              void reloadCategories()
+            }}
+          />
+        </Modal>
+      )}
+
+      {/* IMPORT USERS */}
+      {importOpen && (
+        <Modal title="Import users from CSV" onClose={() => setImportOpen(false)}>
+          <ImportUsersForm
+            api={tenantApi}
+            onClose={() => setImportOpen(false)}
+            onImported={() => {
+              void loadTenantData()
+              void reloadCategories()
+            }}
+          />
+        </Modal>
+      )}
+
+      {/* DEPARTMENT OR GROUP */}
+      {teamEdit && (
+        <Modal title={teamEdit === 'new' ? 'Add department or group' : `Edit ${teamEdit.name}`} onClose={() => setTeamEdit(null)}>
+          <TeamForm
+            api={tenantApi}
+            team={teamEdit === 'new' ? null : teamEdit}
+            members={members}
+            managerOnly={role === 'manager'}
+            onCancel={() => setTeamEdit(null)}
+            onSaved={(text) => {
+              setTeamEdit(null)
+              setToast(text)
+              void reloadTeams()
+            }}
+          />
+        </Modal>
+      )}
+
+      {/* DEFAULT PASSWORD */}
+      {defaultPasswordOpen && (
+        <Modal title="Default password" onClose={() => setDefaultPasswordOpen(false)}>
+          <DefaultPasswordForm api={tenantApi} minLength={passwordMinLength} status={defaultPassword} onSaved={() => void loadDefaultPassword()} />
+        </Modal>
+      )}
+
+      {/* USER CATEGORIES */}
+      {categoriesOpen && (
+        <Modal title="User categories" onClose={() => setCategoriesOpen(false)}>
+          <CategoryManager api={tenantApi} categories={categories} onChanged={() => void reloadCategories()} />
+        </Modal>
+      )}
+
+      {/* OWN PASSWORD */}
+      {passwordOpen && (
+        <Modal title="Change your password" onClose={() => setPasswordOpen(false)}>
+          <ChangePasswordForm api={tenantApi} minLength={passwordMinLength} onChanged={(message) => setToast(message)} />
+        </Modal>
+      )}
+
+      {/* FIRST-LOGIN SETUP */}
+      {setupPending && (
+        <SetupWizard
+          api={tenantApi}
+          workspaceName={tenantInfo.name}
+          canAddAdministrators={canAddAdministrators}
+          passwordMinLength={passwordMinLength}
+          defaultPasswordConfigured={defaultPassword.configured}
+          onUsersAdded={() => void loadTenantData()}
+          onDone={() => {
+            setSetupPending(false)
+            void reloadCategories()
           }}
-        >
-          <div style={{ background: '#fff', padding: '24px', borderRadius: '8px', width: '100%', maxWidth: '400px' }}>
-            <h3 style={{ margin: '0 0 8px 0', fontSize: '17px', fontWeight: 700 }}>Edit Role for {editRoleUser.displayName}</h3>
-            <p style={{ fontSize: '12px', color: '#64748b', margin: '0 0 16px 0' }}>
-              Select the member's new workspace role.
-            </p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
-              {(['admin', 'manager', 'user', 'guest'] as const).map((r) => (
-                <button
-                  key={r}
-                  onClick={() => handleUpdateRole(editRoleUser.id, r)}
-                  style={{
-                    padding: '10px 14px',
-                    borderRadius: '6px',
-                    border: '1px solid',
-                    borderColor: editRoleUser.role === r ? roleBadges[r]?.color : '#e2e8f0',
-                    background: editRoleUser.role === r ? roleBadges[r]?.bg : '#fff',
-                    color: editRoleUser.role === r ? roleBadges[r]?.color : '#334155',
-                    fontWeight: 600,
-                    fontSize: '13px',
-                    cursor: 'pointer',
-                    textAlign: 'left',
-                    textTransform: 'capitalize',
-                  }}
-                >
-                  {r} - {r === 'admin' ? 'Full Administrator' : r === 'manager' ? 'Team Manager' : r === 'user' ? 'Standard User' : 'Guest Auditor'}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => setEditRoleUser(null)}
-              style={{ width: '100%', padding: '8px', background: '#f1f5f9', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' }}
-            >
-              Cancel
-            </button>
+        />
+      )}
+
+      {/* CHANGE ROLE */}
+      {editRoleUser && (
+        <Modal title={`Role for ${editRoleUser.displayName}`} onClose={() => setEditRoleUser(null)}>
+          <div className="ws-role-options" role="radiogroup" aria-label="Role">
+            {assignableRoles.map((r) => (
+              <button
+                key={r}
+                type="button"
+                role="radio"
+                aria-checked={editRoleUser.role === r}
+                onClick={() => (editRoleUser.role === r ? setEditRoleUser(null) : handleUpdateRole(editRoleUser.id, r))}
+              >
+                <span className="ws-radio" />
+                <span>
+                  <strong>{ROLE_INFO[r].label}</strong>
+                  <small>{ROLE_INFO[r].summary}</small>
+                </span>
+              </button>
+            ))}
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   )
-}
-
-const styles: Record<string, React.CSSProperties> = {
-  loginCard: {
-    width: '100%',
-    maxWidth: '430px',
-    backgroundColor: '#fafbfc',
-    borderRadius: '24px',
-    border: '1px solid rgba(255, 255, 255, 0.15)',
-    boxShadow: '0 30px 70px -15px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.08), 0 12px 28px -8px rgba(0, 0, 0, 0.5)',
-    padding: '36px 20px',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '18px',
-    transition: 'padding 0.5s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s ease',
-  },
-  header: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    textAlign: 'center',
-    gap: '6px',
-  },
-  logoBadge: {
-    width: '50px',
-    height: '50px',
-    borderRadius: '16px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: '6px',
-    boxShadow: '0 4px 10px rgba(0, 0, 0, 0.04)',
-    border: '1px solid',
-  },
-  titleRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-  },
-  title: {
-    fontSize: '23px',
-    fontWeight: 700,
-    color: '#0f172a',
-    letterSpacing: '-0.02em',
-    lineHeight: 1.2,
-  },
-  pillBadge: {
-    fontSize: '11px',
-    fontWeight: 600,
-    textTransform: 'uppercase',
-    letterSpacing: '0.06em',
-    borderRadius: '9999px',
-    padding: '2px 9px',
-  },
-  subtitle: {
-    fontSize: '13px',
-    color: '#64748b',
-    marginTop: '2px',
-  },
-  errorBanner: {
-    backgroundColor: '#fef2f2',
-    border: '1px solid #fecaca',
-    color: '#dc2626',
-    fontSize: '13px',
-    fontWeight: 500,
-    padding: '11px 16px',
-    borderRadius: '14px',
-    textAlign: 'center',
-  },
-  form: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '15px',
-  },
-  fieldGroup: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '6px',
-  },
-  label: {
-    fontSize: '12.5px',
-    fontWeight: 600,
-    color: '#334155',
-    letterSpacing: '0.01em',
-    paddingLeft: '2px',
-  },
-  inputWrapper: {
-    position: 'relative',
-    display: 'flex',
-    alignItems: 'center',
-    width: '100%',
-  },
-  inputIcon: {
-    position: 'absolute',
-    left: '14px',
-    color: '#94a3b8',
-    pointerEvents: 'none',
-  },
-  input: {
-    width: '100%',
-    height: '46px',
-    backgroundColor: '#ffffff',
-    border: '1px solid #dcdfe4',
-    borderRadius: '14px',
-    padding: '0 42px 0 42px',
-    fontSize: '14px',
-    color: '#0f172a',
-    outline: 'none',
-    boxShadow: '0 1px 2px rgba(0, 0, 0, 0.03)',
-    transition: 'border-color 0.2s, box-shadow 0.2s',
-  },
-  toggleButton: {
-    position: 'absolute',
-    right: '12px',
-    background: 'none',
-    border: 'none',
-    color: '#94a3b8',
-    cursor: 'pointer',
-    padding: '6px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: '8px',
-  },
-  turnstileMount: {
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    width: '100%',
-  },
-  verifiedPill: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: '6px',
-    backgroundColor: '#ecfdf5',
-    border: '1px solid #a7f3d0',
-    color: '#065f46',
-    fontSize: '12.5px',
-    fontWeight: 500,
-    padding: '9px 14px',
-    borderRadius: '14px',
-  },
 }

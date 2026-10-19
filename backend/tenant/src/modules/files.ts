@@ -1,10 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyRequest } from 'fastify'
 import type { Readable } from 'node:stream'
+import { Transform } from 'node:stream'
 import { z } from 'zod'
 import { configInteger, objectKeyFor } from '@skeleton/server-kit'
 import type { TenantStorage } from '../tenant-storage.js'
-import type { TenantModule, TenantRequestKit } from './types.js'
+import type { TenantModule, TenantRequestKit, TenantSession } from './types.js'
+
+// Bounded buffering until object storage supports a full streaming API.
+const MAX_BUFFERED_UPLOAD_BYTES = 64 * 1024 * 1024
+const effectiveFileLimit = (config: Parameters<typeof configInteger>[0]) =>
+  Math.min(MAX_BUFFERED_UPLOAD_BYTES, configInteger(config, 'limit.storage.max_file_mb', 25) * 1024 * 1024)
 
 export type StoredFile = {
   id: string
@@ -67,7 +73,7 @@ export function createFileService(storage: TenantStorage) {
     ): Promise<StoredFile> {
       const context = kit.tenant(request)
       const config = await kit.config(request)
-      const maxFileBytes = configInteger(config, 'limit.storage.max_file_mb', 25) * 1024 * 1024
+      const maxFileBytes = effectiveFileLimit(config)
       if (input.body.length > maxFileBytes) throw new FileLimitError(`Files may be at most ${maxFileBytes / 1024 / 1024} MB.`, 413)
       const fileName = input.fileName.replace(/[\u0000-\u001f\\/]/g, '_').trim().slice(0, 255) || 'file'
       const contentType = contentTypePattern.test(input.contentType) ? input.contentType : 'application/octet-stream'
@@ -76,24 +82,26 @@ export function createFileService(storage: TenantStorage) {
       const storageRef = storage.activeRef(context)
       const key = objectKeyFor(objectId)
       const sha256 = createHash('sha256').update(input.body).digest('hex')
-      // Reserve the metadata row first (quota checked under a lock), then
-      // write bytes, so a failed write never leaves bytes without a record.
-      await kit.withTenant(request, async (client) => {
-        await client.query('select pg_advisory_xact_lock(hashtext($1))', [`tenant-storage-quota:${context.schemaName}`])
-        if (quotaBytes > 0) {
-          const used = Number((await client.query<{ used: string }>('select coalesce(sum(size_bytes), 0) as used from stored_object')).rows[0]?.used)
-          if (used + input.body.length > quotaBytes) throw new FileLimitError('This workspace has reached its storage quota.', 409)
-        }
-        await client.query(
-          `insert into stored_object (object_id, storage_ref, object_key, file_name, content_type, size_bytes, sha256, module_code, created_by)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [objectId, storageRef, key, fileName, contentType, input.body.length, sha256, input.moduleCode ?? null, input.createdBy],
-        )
-      })
+      const store = await storage.store(context, storageRef)
+      // Keep byte publication and metadata commit behind the shared recovery
+      // gate. A backup takes the exclusive gate across dump + file collection.
       try {
-        await (await storage.store(context, storageRef)).put(key, input.body, contentType)
+        await kit.withTenant(request, async (client) => {
+          await client.query('select pg_advisory_xact_lock_shared(hashtext($1))', ['skeleton-local-storage-backup'])
+          await client.query('select pg_advisory_xact_lock(hashtext($1))', [`tenant-storage-quota:${context.schemaName}`])
+          if (quotaBytes > 0) {
+            const used = Number((await client.query<{ used: string }>('select coalesce(sum(size_bytes), 0) as used from stored_object')).rows[0]?.used)
+            if (used + input.body.length > quotaBytes) throw new FileLimitError('This workspace has reached its storage quota.', 409)
+          }
+          await client.query(
+            `insert into stored_object (object_id, storage_ref, object_key, file_name, content_type, size_bytes, sha256, module_code, created_by)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [objectId, storageRef, key, fileName, contentType, input.body.length, sha256, input.moduleCode ?? null, input.createdBy],
+          )
+          await store.put(key, input.body, contentType)
+        })
       } catch (error) {
-        await kit.withTenant(request, (client) => client.query('delete from stored_object where object_id = $1', [objectId]))
+        await store.delete(key).catch(() => undefined)
         throw error
       }
       return { id: objectId, fileName, contentType, sizeBytes: input.body.length, sha256, storage: storageRef === 'vds' ? 'vds' : 'external', moduleCode: input.moduleCode ?? null, createdAt: new Date().toISOString() }
@@ -109,12 +117,13 @@ export function createFileService(storage: TenantStorage) {
     },
 
     async remove(request: FastifyRequest, objectId: string): Promise<boolean> {
-      const row = await kit.withTenant(request, async (client) =>
-        (await client.query<Row>('delete from stored_object where object_id = $1 returning *, size_bytes::text', [objectId])).rows[0],
-      )
-      if (!row) return false
-      await (await storage.store(kit.tenant(request), row.storage_ref)).delete(row.object_key).catch(() => undefined)
-      return true
+      return kit.withTenant(request, async (client) => {
+        await client.query('select pg_advisory_xact_lock_shared(hashtext($1))', ['skeleton-local-storage-backup'])
+        const row = (await client.query<Row>('delete from stored_object where object_id = $1 returning *, size_bytes::text', [objectId])).rows[0]
+        if (!row) return false
+        await (await storage.store(kit.tenant(request), row.storage_ref)).delete(row.object_key).catch(() => undefined)
+        return true
+      })
     },
 
     async list(request: FastifyRequest, options: { limit: number; moduleCode?: string | undefined }): Promise<StoredFile[]> {
@@ -143,9 +152,17 @@ export function createFileService(storage: TenantStorage) {
     code: 'files',
     register(app, kit) {
       const files = service(kit)
+      const uploadSessions = new WeakMap<FastifyRequest, TenantSession>()
+      const uploads = new WeakSet<FastifyRequest>()
+      let activeUploads = 0
+      const releaseUpload = (request: FastifyRequest) => {
+        if (uploads.delete(request)) activeUploads -= 1
+      }
+      app.addHook('onResponse', async (request) => releaseUpload(request))
+      app.addHook('onError', async (request) => releaseUpload(request))
       // Uploads arrive as raw bytes; the real type travels in X-Content-Type
       // so a .json upload is never parsed as a JSON request body.
-      app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 1024 * 1024 * 1024 }, (_request, body, done) => done(null, body))
+      app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: MAX_BUFFERED_UPLOAD_BYTES }, (_request, body, done) => done(null, body))
 
       app.get('/api/v1/files', async (request, reply) => {
         const session = await kit.requireSession(request, reply)
@@ -156,21 +173,38 @@ export function createFileService(storage: TenantStorage) {
           success: true,
           files: await files.list(request, { limit: query.limit, moduleCode: query.module }),
           usage: await files.usage(request),
-          limits: { maxFileMb: configInteger(config, 'limit.storage.max_file_mb', 25), quotaMb: configInteger(config, 'limit.storage.max_mb', 0) },
+          limits: { maxFileMb: effectiveFileLimit(config) / 1024 / 1024, quotaMb: configInteger(config, 'limit.storage.max_mb', 0) },
           activeBackend: kit.tenant(request).storageIntegrationId ? 'external' : 'vds',
         }
       })
 
       app.post('/api/v1/files', {
-        preParsing: async (request, reply) => {
+        preParsing: async (request, reply, payload) => {
+          const session = await kit.requireSession(request, reply)
+          if (!session) return reply
+          if (!(await kit.requirePermission(request, reply, session, 'tenant.files.write')) || !kit.requireCsrf(request, reply, session)) return reply
           const declared = Number(request.headers['content-length'] || 0)
-          const limit = configInteger(await kit.config(request), 'limit.storage.max_file_mb', 25) * 1024 * 1024
+          const limit = effectiveFileLimit(await kit.config(request))
           if (declared > limit) return reply.code(413).send({ success: false, message: `Files may be at most ${limit / 1024 / 1024} MB.` })
+          if (activeUploads >= 2) return reply.code(429).header('Retry-After', '2').send({ success: false, message: 'Uploads are busy. Try again shortly.' })
+          activeUploads += 1
+          uploads.add(request)
+          uploadSessions.set(request, session)
+          request.raw.once('aborted', () => releaseUpload(request))
+          const limited = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              limited.receivedEncodedLength += chunk.length
+              if (limited.receivedEncodedLength > limit) return callback(new FileLimitError(`Files may be at most ${limit / 1024 / 1024} MB.`, 413))
+              callback(null, chunk)
+            },
+          }) as Transform & { receivedEncodedLength: number }
+          limited.receivedEncodedLength = 0
+          payload.once('error', (error) => limited.destroy(error))
+          return payload.pipe(limited)
         },
       }, async (request, reply) => {
-        const session = await kit.requireSession(request, reply)
+        const session = uploadSessions.get(request)
         if (!session) return
-        if (!(await kit.requirePermission(request, reply, session, 'tenant.files.write')) || !kit.requireCsrf(request, reply, session)) return
         if (!Buffer.isBuffer(request.body)) return reply.code(415).send({ success: false, message: 'Send the file as application/octet-stream.' })
         const rawName = String(request.headers['x-file-name'] || '')
         let fileName = 'file'

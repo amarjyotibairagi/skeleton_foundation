@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
 import { z } from 'zod'
 import {
+  ARGON2ID_OPTIONS,
   configStringList,
   createSharedRateLimitStore,
   createThrottleStore,
@@ -33,6 +34,7 @@ import {
   createTenantSchema,
   getProvisioningJob,
   listTenants,
+  type OwnerAccountBootstrap,
   resumeTenant,
   retryProvisioningJob,
   suspendTenant,
@@ -42,6 +44,7 @@ import {
 } from './tenant-provisioning.js'
 import {
   requireRecentMfa,
+  MfaEnrollmentError,
   isMfaRecent,
   generateRegistrationChallenge,
   verifyRegistrationAssertion,
@@ -137,6 +140,13 @@ const loginSchema = z.object({
   password: z.string().min(1).max(512),
   turnstileToken: z.string().min(20).max(4096),
 })
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1).max(512),
+  newPassword: z.string().min(1).max(512),
+})
+// Operators guard the whole platform; same floor as operator invitations.
+const OPERATOR_PASSWORD_MIN_LENGTH = 14
 
 const dnsCreateSchema = z.object({
   label: z
@@ -640,7 +650,7 @@ export async function createServer(): Promise<FastifyInstance> {
 
   const app = Fastify({
     logger: {
-      redact: ['req.headers.cookie', 'req.headers.authorization', 'req.body.password'],
+      redact: ['req.headers.cookie', 'req.headers.authorization', 'req.body.password', 'req.body.owner.password', 'req.body.currentPassword', 'req.body.newPassword'],
     },
     bodyLimit: 64 * 1024,
     // Trust X-Forwarded-For / CF-Connecting-IP only when the immediate TCP
@@ -686,6 +696,9 @@ export async function createServer(): Promise<FastifyInstance> {
   })
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof MfaEnrollmentError) {
+      return reply.code(403).send({ success: false, code: error.code, message: error.message })
+    }
     // Messages raised by the control-plane functions (migrations 026, 027)
     // are authored for operators and contain no internal detail.
     const databaseCode = (error as { code?: string }).code
@@ -955,6 +968,45 @@ export async function createServer(): Promise<FastifyInstance> {
     return { success: true }
   })
 
+  // An operator changes their own password. Needs the current password and a
+  // recent step-up like every other control-plane mutation; other sessions
+  // of the operator end, this one stays signed in.
+  app.post('/api/auth/password', { config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } }, async (request, reply) => {
+    const auth = await requireAuth(request, reply, pool, anyPlatformRole)
+    if (!auth) return reply
+    if (!requireCsrf(request, reply, auth)) return reply
+    if (!requireRecentMfa(reply, auth)) return reply
+    const body = changePasswordSchema.parse(request.body)
+    if (body.newPassword.length < OPERATOR_PASSWORD_MIN_LENGTH) {
+      return reply.code(400).send({ success: false, message: `The new password must be at least ${OPERATOR_PASSWORD_MIN_LENGTH} characters.` })
+    }
+    if (body.newPassword === body.currentPassword) {
+      return reply.code(400).send({ success: false, message: 'The new password must differ from the current one.' })
+    }
+    const current = (
+      await pool.query<{ password_hash: string | null }>('select password_hash from platform.platform_user where id = $1 and is_active', [auth.user.id])
+    ).rows[0]?.password_hash
+    let matches = false
+    try {
+      matches = await argon2.verify(current || DUMMY_PASSWORD_HASH, body.currentPassword)
+    } catch {
+      matches = false
+    }
+    if (!current || !matches) {
+      await audit(pool, auth.user.id, 'platform_operators', 'operator_password_change_rejected', 'denied')
+      return reply.code(400).send({ success: false, message: 'The current password is incorrect.' })
+    }
+    const newHash = await argon2.hash(body.newPassword, ARGON2ID_OPTIONS)
+    const changed = await pool.query<{ changed: boolean }>(
+      'select platform.change_platform_operator_password($1, $2, $3, $4) as changed',
+      [auth.user.id, auth.sessionId, current, newHash],
+    )
+    if (!changed.rows[0]?.changed) {
+      return reply.code(409).send({ success: false, message: 'Your password was changed elsewhere. Sign in again and retry.' })
+    }
+    return { success: true, message: 'Password changed. Your other sessions have been signed out.' }
+  })
+
   app.get('/api/tenants', async (request, reply) => {
     const auth = await requireAuth(request, reply, pool, adminRoles)
     if (!auth) return reply
@@ -986,9 +1038,35 @@ export async function createServer(): Promise<FastifyInstance> {
            'dedicated') as tier`,
         [body.planCode ?? null],
       )).rows[0]?.tier === 'pooled' ? 'pooled' : 'dedicated')
+      if (body.modules.length) {
+        const known = await pool.query<{ key: string }>(
+          `select config_key as key from platform.config_definition
+            where kind = 'feature' and value_type = 'boolean' and 'tenant' = any(scopes) and config_key = any($1::text[])`,
+          [body.modules],
+        )
+        const unknown = body.modules.filter((key) => !known.rows.some((row) => row.key === key))
+        if (unknown.length) {
+          return reply.code(400).send({ success: false, message: `Unknown module: ${unknown.join(', ')}.` })
+        }
+      }
+      // The default administrator's password is hashed here; only the argon2id
+      // hash reaches the database, and the worker clears it once applied.
+      let ownerAccount: OwnerAccountBootstrap | undefined
+      if (body.owner?.password && body.owner.username) {
+        const minLength = Number((settings.values['auth.password.min_length'] as number | undefined) ?? 8)
+        if (body.owner.password.length < minLength) {
+          return reply.code(400).send({ success: false, message: `The administrator password must be at least ${minLength} characters.` })
+        }
+        ownerAccount = {
+          username: body.owner.username,
+          displayName: body.owner.displayName,
+          email: body.owner.email || null,
+          passwordHash: await argon2.hash(body.owner.password, ARGON2ID_OPTIONS),
+        }
+      }
       const result = await createTenantProvisioningJob(
         pool,
-        { ...body, connectionTier },
+        { ...body, connectionTier, ownerAccount },
         auth.user.id,
         config.tenantRootDomain,
         randomUUID(),
@@ -1006,12 +1084,18 @@ export async function createServer(): Promise<FastifyInstance> {
           onboarding.planError = (error as Error).message
         }
       }
-      if (body.owner) {
+      if (ownerAccount) {
+        onboarding.ownerAccount = {
+          username: ownerAccount.username,
+          loginUrl: `https://${result.tenant.hostname}`,
+          note: 'The administrator can sign in once the tenant is active.',
+        }
+      } else if (body.owner?.email) {
         const ttl = Number((settings.values['invitations.ttl_hours'] as number | undefined) ?? 72)
         onboarding.ownerInvitation = await issueOwnerInvitation(
           { pool, notifier, tenantRootDomain: config.tenantRootDomain },
           result.tenant.tenantId,
-          body.owner,
+          { email: body.owner.email, displayName: body.owner.displayName },
           auth.user.id,
           ttl,
         )

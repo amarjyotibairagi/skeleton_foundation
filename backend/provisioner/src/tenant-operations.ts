@@ -250,9 +250,20 @@ export async function copyTenantData(
         throw new Error(`Schema versions differ (source ${sourceVersion}, target ${targetVersion}); upgrade both first.`)
       }
       const tables = await copyOrder(from, placementSchema(source), accessManifest)
+      // Module triggers can skip side effects (mirrors, derived rows) while rows are
+      // copied verbatim: current_setting('app.relocating', true) = 'true'.
+      await to.query(`select set_config('app.relocating','true',true)`)
+      await to.query('set constraints all deferred')
       await to.query(`truncate table ${tables.map(quote).join(', ')}`)
       const counts: Record<string, number> = {}
       for (const table of tables) {
+        // Stored generated columns must be recomputed by PostgreSQL at the target.
+        const columns = (await to.query<{ column_name: string }>(
+          `select column_name from information_schema.columns
+           where table_schema=$1 and table_name=$2 and is_generated='NEVER'
+           order by ordinal_position`, [placementSchema(target),table],
+        )).rows.map(row => '"' + row.column_name.replaceAll('"','""') + '"').join(', ')
+        if (!columns) throw new Error(`No writable columns in ${table}.`)
         const cursor = `copy_${table}`
         await from.query(`declare ${quote(cursor)} no scroll cursor for select to_jsonb(t)::text as row from ${quote(table)} t`)
         let copied = 0
@@ -260,7 +271,7 @@ export async function copyTenantData(
           const batch = await from.query<{ row: string }>(`fetch 500 from ${quote(cursor)}`)
           if (!batch.rows.length) break
           await to.query(
-            `insert into ${quote(table)} select * from jsonb_populate_recordset(null::${quote(table)}, $1::jsonb)`,
+            `insert into ${quote(table)} (${columns}) select ${columns} from jsonb_populate_recordset(null::${quote(table)}, $1::jsonb)`,
             [`[${batch.rows.map((item) => item.row).join(',')}]`],
           )
           copied += batch.rows.length

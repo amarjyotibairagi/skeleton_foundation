@@ -132,6 +132,14 @@ BFF caches a tenant's resolved configuration for `TENANT_CONFIG_CACHE_TTL_MS`
    `withTenant`; never accept schema, role, or tenant identifiers from the
    client; audit denials and state changes.
 
+   Inside `withTenant`, `current_setting('app.tenant_id')` is the tenant and
+   `current_setting('app.user_id', true)` the signed-in user (empty when signed
+   out), for row-level security policies. While the provisioner copies a
+   tenant's data to another database it sets `app.relocating = 'true'`; make
+   triggers that write derived rows skip themselves in that case. To give a
+   department or group access to something, reference `team(team_id)` from a
+   module table; teams themselves are managed by the core teams module.
+
 5. **Files.** Use `kit.files.save(request, { fileName, contentType, body, createdBy, moduleCode: 'projects' })`,
    `kit.files.open(request, id)` and `kit.files.remove(request, id)`. The
    file service enforces `limit.storage.max_file_mb` and `limit.storage.max_mb`,
@@ -150,22 +158,29 @@ The reference module is `backend/tenant/src/modules/delegations.ts`
 
 ## Admin panel surface
 
-| Area | What operators control | API |
-| --- | --- | --- |
-| Tenant / New | Provision, with optional first owner and plan | `POST /api/tenants` |
-| Tenant / Manage | Profile & branding, plan, owner invitations, per-tenant overrides, job history | `GET/PATCH /api/tenants/:key`, `PUT /api/tenants/:key/plan`, `POST/DELETE /api/tenants/:key/owner-invitations` |
-| Tenant / Fleet | Schema version drift, failures, job outcomes | `GET /api/fleet/status` |
-| Platform / Configuration | Platform-wide defaults for every key | `GET /api/config/definitions`, `PUT/DELETE /api/config/values` |
-| Platform / Plans | Plans and their entitlements | `GET/POST /api/plans`, config at `plan` scope |
-| Platform / Operators | Invite, role, enable/disable, reset access or keys, end sessions | `/api/platform/users/*` |
-| Platform / Audit | Filterable, paginated control-plane audit | `GET /api/audit/events` |
-| Platform / Individuals | B2C accounts: status, sessions, plan | `/api/consumers/*` |
-| Tenant / Manage → Storage & database | Bring-your-own bucket or database: save, test, activate, move files or data, move back | `/api/tenants/:key/integrations/*`, `/storage/*`, `/database/use-vds` |
-| Tenant / Manage, Tenant / Fleet | Schema upgrades per tenant or for every tenant behind | `POST /api/tenants/:key/migrate`, `POST /api/fleet/migrate` |
-| Platform / My Security | Security-key enrolment and step-up | `/api/auth/mfa/*` |
+The console (`frontend/platform`) has hash routes, so every page can be linked.
+Sidebar groups and the role that can open each page are in `src/shell/nav.ts`.
 
-All mutations require the operator's CSRF token and a WebAuthn step-up within
-the last five minutes; the panel runs the step-up automatically when needed.
+| Console page | What operators control | API |
+| --- | --- | --- |
+| Dashboard | Needs attention (failed tenants, pending upgrades, resource pressure, denials), headline numbers, recent activity, job outcomes | the read endpoints below |
+| Tenants | List with status filters; suspend, resume, remove (owner; type the subdomain), retry a failed removal | `GET /api/tenants`, `POST /api/tenants/:key/{suspend,resume,deprovision}`, `POST /api/tenant-provisioning/:job/retry` |
+| Tenants › New tenant | Provision with branding, the first administrator (login now, emailed invitation, or later), modules, plan and connection tier; live step progress | `POST /api/tenants`, `GET /api/tenant-provisioning/:job` |
+| Tenants › *tenant* | Tabs: overview and schema upgrade, profile and branding, plan and modules, administrator access (owner invitations), storage and data (bring your own), configuration overrides, jobs | `GET/PATCH /api/tenants/:key`, `PUT /api/tenants/:key/plan`, `PUT /api/config/values`, `POST/DELETE /api/tenants/:key/owner-invitations`, `/api/tenants/:key/integrations/*`, `POST /api/tenants/:key/migrate` |
+| Individuals | B2C accounts: status, sessions, plan | `/api/consumers/*` |
+| Plans | Plans, public pricing and entitlements (configuration at `plan` scope) | `GET/POST /api/plans`, `PATCH /api/plans/:code/presentation` |
+| Domains | DNS records in the zone, tenant hostnames and how they are routed; add or delete platform-managed subdomains (owner) | `GET/POST/DELETE /api/cloudflare/subdomains` |
+| Fleet & schema | Schema version drift and failures; upgrade every tenant that is behind | `GET /api/fleet/status`, `POST /api/fleet/migrate` |
+| Server | Live CPU, memory, disk and listening services (needs a recent security-key check) | `GET /api/system/{hardware,services}` |
+| Configuration | Platform-wide defaults for every key (owner edits) | `GET /api/config/definitions`, `PUT/DELETE /api/config/values` |
+| Operators | Invite, role, enable/disable, reset access or keys, end sessions (owner) | `/api/platform/users/*` |
+| Audit log | Filterable, paginated control-plane audit | `GET /api/audit/events` |
+| Account menu › My security | Password change, security-key enrolment and step-up | `POST /api/auth/password`, `/api/auth/mfa/*` |
+
+All mutations, and reads of live server telemetry, require the operator's CSRF
+token (mutations) and a WebAuthn step-up within the last five minutes. The
+console runs the step-up automatically for mutations and shows a *Verify with
+security key* button on panels whose reads need it.
 Writes go through `SECURITY DEFINER` functions that enforce invariants (for
 example, at least one active `platform_owner` always remains) and write
 `platform.platform_audit` in the same transaction.
@@ -185,8 +200,8 @@ example, at least one active `platform_owner` always remains) and write
 
 ## Bring-your-own storage and databases
 
-Tenants keep files and data on the VDS by default. From **Tenant / Manage →
-Storage & database** (operators) or **Settings → Storage & database** (tenant
+Tenants keep files and data on the VDS by default. From **Tenants › *tenant* →
+Storage & data** (operators) or **Settings → Storage & database** (tenant
 owners, if the plan enables `integration.byo_storage` /
 `integration.byo_database`), a tenant can connect:
 

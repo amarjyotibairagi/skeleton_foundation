@@ -2,7 +2,9 @@ import type { Pool } from 'pg'
 
 const hostnamePattern = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
 
-export const MIN_SUPPORTED_SCHEMA_VERSION = 7
+// The workspace code needs user categories (009), default passwords (010) and
+// department/group kinds (012); older schemas are upgraded before serving.
+export const MIN_SUPPORTED_SCHEMA_VERSION = 12
 
 export type TenantLifecycleStatus =
   | 'provisioning'
@@ -59,7 +61,7 @@ type TenantRegistryRow = {
   schema_version: number
   hostname: string
   subdomain: string
-  domain_status: 'pending' | 'active' | 'disabled' | 'failed'
+  domain_status: 'pending' | 'active' | 'disabled' | 'failed' | 'released'
   connection_tier: 'dedicated' | 'pooled' | null
   data_integration_id: string | null
   storage_integration_id: string | null
@@ -116,6 +118,45 @@ export class TenantResolver {
     }
   }
 
+  /**
+   * Hostname of the active tenant a user means by `company` on the shared app host: its
+   * subdomain ("shadow"), full hostname, or exact display name. Anything ambiguous or unknown
+   * resolves to nothing; callers must not reveal which.
+   */
+  async hostnameForCompany(company: string): Promise<string | null> {
+    const value = company
+      .trim()
+      .toLowerCase()
+      .replace(/^[a-z]+:\/\//, '')
+      .replace(/[/?#].*$/, '')
+      .replace(/\.$/, '')
+    if (!value || value.length > 255) return null
+    const result = await this.registryPool.query<{ hostname: string }>(
+      `select distinct d.hostname
+         from platform.tenant_domain d
+         join platform.tenant_registry t on t.tenant_id = d.tenant_id
+        where d.is_primary and d.status = 'active' and t.lifecycle_status = 'active'
+          and (lower(t.slug) = $1 or lower(d.hostname) = $1 or lower(t.display_name) = $1)
+        limit 2`,
+      [value],
+    )
+    return result.rows.length === 1 ? result.rows[0]!.hostname : null
+  }
+
+  /** Primary hostname of an active tenant by its immutable key (the shared app host's remembered company). */
+  async hostnameForKey(tenantKey: string): Promise<string | null> {
+    if (!/^T[A-Z0-9]{3,63}$/.test(tenantKey)) return null
+    const result = await this.registryPool.query<{ hostname: string }>(
+      `select d.hostname
+         from platform.tenant_domain d
+         join platform.tenant_registry t on t.tenant_id = d.tenant_id
+        where t.tenant_key = $1 and d.is_primary and d.status = 'active' and t.lifecycle_status <> 'deleted'
+        limit 1`,
+      [tenantKey],
+    )
+    return result.rows[0]?.hostname ?? null
+  }
+
   private cacheNegative(hostname: string): void {
     if (this.negativeCache.size >= this.maximumNegativeEntries) {
       const oldest = this.negativeCache.keys().next().value
@@ -154,7 +195,7 @@ export class TenantResolver {
        join platform.tenant_registry t on t.tenant_id = d.tenant_id
        left join platform.tenant_branding b on b.tenant_id = t.tenant_id
        left join platform.tenant_integration di on di.integration_id = t.data_integration_id
-       where lower(d.hostname) = $1
+       where lower(d.hostname) = $1 and d.status <> 'released'
        limit 1`,
       [hostname],
     )

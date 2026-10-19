@@ -1,7 +1,8 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import type { AdminApi } from './api'
+import { useState, type FormEvent } from 'react'
+import { Layers, Plus } from 'lucide-react'
+import { isAdmin, isOwner, useConsole } from '../shell/context'
 import { ConfigEditor, type ConfigDefinition } from './ConfigEditor'
-import { Badge, Card, Field, Notice, PageHeader, useAsyncAction } from './ui'
+import { Badge, Card, EmptyState, Field, Modal, Notice, PageHeader, Table, useAsyncAction, useResource } from './ui'
 
 type Plan = {
   planCode: string
@@ -17,21 +18,19 @@ type Plan = {
   sortOrder: number
 }
 
-export function PlansView({ api, canEdit }: { api: AdminApi; canEdit: boolean }) {
-  const [plans, setPlans] = useState<Plan[]>([])
-  const [definitions, setDefinitions] = useState<ConfigDefinition[]>([])
+const audienceLabel = { b2b: 'Tenants', b2c: 'Individuals', both: 'Both' } as const
+
+export function PlansView() {
+  const { api, user } = useConsole()
+  const canEdit = isOwner(user)
+  const plans = useResource<Plan[]>(async () => (await api.get('/api/plans')).plans, [api])
+  const definitions = useResource<ConfigDefinition[]>(async () => (await api.get('/api/config/definitions')).definitions, [api])
   const [selected, setSelected] = useState<string | null>(null)
-  const loader = useAsyncAction()
+  const [creating, setCreating] = useState(false)
   const action = useAsyncAction()
 
-  const load = () =>
-    loader.run(async () => {
-      const [planList, defs] = await Promise.all([api.get('/api/plans'), api.get('/api/config/definitions')])
-      setPlans(planList.plans)
-      setDefinitions(defs.definitions)
-      if (!selected && planList.plans[0]) setSelected(planList.plans[0].planCode)
-    })
-  useEffect(() => { void load() }, [])
+  const list = plans.data ?? []
+  const plan = list.find((item) => item.planCode === selected) ?? list[0]
 
   const savePlan = (event: FormEvent<HTMLFormElement>, existing?: Plan) => {
     event.preventDefault()
@@ -45,95 +44,143 @@ export function PlansView({ api, canEdit }: { api: AdminApi; canEdit: boolean })
         audience: form.get('audience'),
         isActive: form.get('isActive') === 'on',
       })
-      if (!existing) formElement.reset()
       setSelected(planCode)
-      await load()
+      setCreating(false)
+      await plans.reload()
       return `Plan ${planCode} saved.`
     })
   }
 
-  const plan = plans.find((item) => item.planCode === selected)
   return (
-    <div className="admin-view">
-      <PageHeader eyebrow="Platform / Plans" title="Plans & entitlements" subtitle="Plan values sit between platform defaults and tenant overrides" onRefresh={() => void load()} busy={loader.busy} />
-      {loader.error && <Notice tone="error">{loader.error}</Notice>}
+    <div className="page">
+      <PageHeader
+        title="Plans"
+        description="Plans group entitlements. Their values sit between the platform defaults and a tenant's own overrides."
+        onRefresh={() => void plans.reload()}
+        busy={plans.loading}
+        actions={canEdit && <button type="button" className="btn btn-primary" onClick={() => setCreating(true)}><Plus size={15} /> New plan</button>}
+      />
+      {plans.error && <Notice tone="error">{plans.error}</Notice>}
       {action.error && <Notice tone="error">{action.error}</Notice>}
       {action.message && <Notice tone="success">{action.message}</Notice>}
-      <div className="admin-grid">
-        <Card title="Plans">
-          <table className="admin-table">
-            <thead><tr><th>Plan</th><th>Audience</th><th>Tenants</th><th>State</th></tr></thead>
+
+      <Card title="All plans" flush>
+        {list.length === 0 ? (
+          <EmptyState icon={<Layers size={20} />} title={plans.loading ? 'Loading plans…' : 'No plans yet'} />
+        ) : (
+          <Table>
+            <thead><tr><th>Plan</th><th>For</th><th className="right">Tenants</th><th>Price</th><th>State</th></tr></thead>
             <tbody>
-              {plans.map((item) => (
-                <tr key={item.planCode} className={item.planCode === selected ? 'admin-row-selected' : undefined} onClick={() => setSelected(item.planCode)}>
-                  <td><span className="admin-strong">{item.displayName}</span><div className="admin-hint"><code>{item.planCode}</code> · v{item.version}</div></td>
-                  <td>{item.audience}</td>
-                  <td>{item.tenantCount}</td>
-                  <td>{item.isActive ? <Badge tone="good">active</Badge> : <Badge>retired</Badge>}</td>
+              {list.map((item) => (
+                <tr key={item.planCode} className={`row-link${item.planCode === plan?.planCode ? ' row-selected' : ''}`} onClick={() => setSelected(item.planCode)}>
+                  <td><span className="cell-title">{item.displayName}</span><span className="cell-sub"><span className="mono">{item.planCode}</span> · version {item.version}</span></td>
+                  <td>{audienceLabel[item.audience]}</td>
+                  <td className="right num">{item.tenantCount}</td>
+                  <td className="num">{item.priceMonthly === null ? <span className="muted">—</span> : `${item.priceMonthly.toFixed(2)} / month`}</td>
+                  <td>{item.isActive ? <Badge tone="good" dot>Active</Badge> : <Badge dot>Retired</Badge>}</td>
                 </tr>
               ))}
             </tbody>
-          </table>
-        </Card>
-        {canEdit && (
-          <Card title="New plan">
-            <form className="admin-form" onSubmit={(event) => savePlan(event)}>
-              <Field label="Code" hint="lowercase, e.g. enterprise"><input className="admin-input" name="planCode" required pattern="[a-z][a-z0-9_]{1,62}" /></Field>
-              <Field label="Display name"><input className="admin-input" name="displayName" required maxLength={120} /></Field>
-              <Field label="Audience">
-                <select className="admin-input" name="audience" defaultValue="b2b"><option value="b2b">B2B tenants</option><option value="b2c">B2C users</option><option value="both">Both</option></select>
-              </Field>
-              <label className="admin-check"><input type="checkbox" name="isActive" defaultChecked /> Available for assignment</label>
-              <button className="admin-button admin-button-primary" disabled={action.busy}>Create plan</button>
-            </form>
-          </Card>
+          </Table>
         )}
-      </div>
+      </Card>
+
       {plan && (
         <>
           {canEdit && (
-            <Card title={`Edit ${plan.displayName}`}>
-              <form className="admin-form admin-form-inline" onSubmit={(event) => savePlan(event, plan)} key={`${plan.planCode}-${plan.version}`}>
-                <input className="admin-input" name="displayName" defaultValue={plan.displayName} required maxLength={120} />
-                <select className="admin-input" name="audience" defaultValue={plan.audience}><option value="b2b">B2B</option><option value="b2c">B2C</option><option value="both">Both</option></select>
-                <label className="admin-check"><input type="checkbox" name="isActive" defaultChecked={plan.isActive} /> Active</label>
-                <button className="admin-button admin-button-primary" disabled={action.busy}>Save</button>
-              </form>
-            </Card>
+            <div className="grid-2">
+              <Card title={`${plan.displayName}: details`}>
+                <form className="form" onSubmit={(event) => savePlan(event, plan)} key={`${plan.planCode}-${plan.version}`}>
+                  <div className="form-grid">
+                    <Field label="Display name"><input className="input" name="displayName" defaultValue={plan.displayName} required maxLength={120} /></Field>
+                    <Field label="Available to">
+                      <select className="input" name="audience" defaultValue={plan.audience}>
+                        <option value="b2b">Tenants (B2B)</option>
+                        <option value="b2c">Individuals (B2C)</option>
+                        <option value="both">Both</option>
+                      </select>
+                    </Field>
+                  </div>
+                  <label className="check"><input type="checkbox" name="isActive" defaultChecked={plan.isActive} /> Available for assignment</label>
+                  <div className="form-actions"><button className="btn btn-primary" disabled={action.busy}>Save details</button></div>
+                </form>
+              </Card>
+              {plan.audience !== 'b2b' ? (
+                <Card title="Shown on the public app">
+                  <form
+                    className="form"
+                    key={`${plan.planCode}-presentation-${plan.description}-${plan.priceMonthly}`}
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      const form = new FormData(event.currentTarget)
+                      const price = String(form.get('priceMonthly') || '').trim()
+                      void action.run(async () => {
+                        await api.send('PATCH', `/api/plans/${plan.planCode}/presentation`, {
+                          description: String(form.get('description') || ''),
+                          priceMonthly: price === '' ? null : Number(price),
+                          highlights: String(form.get('highlights') || '').split('\n').map((line) => line.trim()).filter(Boolean),
+                          sortOrder: Number(form.get('sortOrder') || 100),
+                        })
+                        await plans.reload()
+                        return 'Public plan details saved. The public app picks them up within a minute.'
+                      })
+                    }}
+                  >
+                    <Field label="Description"><input className="input" name="description" defaultValue={plan.description} maxLength={500} /></Field>
+                    <div className="form-grid">
+                      <Field label="Monthly price"><input className="input" name="priceMonthly" type="number" min={0} step="0.01" defaultValue={plan.priceMonthly ?? ''} /></Field>
+                      <Field label="Order" hint="Lower comes first"><input className="input" name="sortOrder" type="number" defaultValue={plan.sortOrder} /></Field>
+                    </div>
+                    <Field label="Highlights" hint="One per line"><textarea className="input" name="highlights" rows={4} defaultValue={plan.highlights.join('\n')} /></Field>
+                    <div className="form-actions"><button className="btn btn-primary" disabled={action.busy}>Save public details</button></div>
+                  </form>
+                </Card>
+              ) : (
+                <Card title="Public app">
+                  <p className="hint">This plan is for tenants only, so it is not listed on the public app.</p>
+                </Card>
+              )}
+            </div>
           )}
-          {canEdit && plan.audience !== 'b2b' && (
-            <Card title="Shown on the public app">
-              <form
-                className="admin-form admin-form-grid"
-                key={`${plan.planCode}-presentation-${plan.description}-${plan.priceMonthly}`}
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  const form = new FormData(event.currentTarget)
-                  const price = String(form.get('priceMonthly') || '').trim()
-                  void action.run(async () => {
-                    await api.send('PATCH', `/api/plans/${plan.planCode}/presentation`, {
-                      description: String(form.get('description') || ''),
-                      priceMonthly: price === '' ? null : Number(price),
-                      highlights: String(form.get('highlights') || '').split('\n').map((line) => line.trim()).filter(Boolean),
-                      sortOrder: Number(form.get('sortOrder') || 100),
-                    })
-                    await load()
-                    return 'Public plan details saved. The public app picks them up within a minute.'
-                  })
-                }}
-              >
-                <Field label="Description"><input className="admin-input" name="description" defaultValue={plan.description} maxLength={500} /></Field>
-                <Field label="Monthly price"><input className="admin-input" name="priceMonthly" type="number" min={0} step="0.01" defaultValue={plan.priceMonthly ?? ''} /></Field>
-                <Field label="Order"><input className="admin-input" name="sortOrder" type="number" defaultValue={plan.sortOrder} /></Field>
-                <Field label="Highlights" hint="One per line"><textarea className="admin-input" name="highlights" rows={4} defaultValue={plan.highlights.join('\n')} /></Field>
-                <div><button className="admin-button admin-button-primary" disabled={action.busy}>Save public details</button></div>
-              </form>
-            </Card>
-          )}
-          <Card title={`Entitlements for ${plan.displayName}`}>
-            <ConfigEditor api={api} definitions={definitions} scope={{ scope: 'plan', ref: plan.planCode }} overrides={plan.overrides} onChanged={() => void load()} />
+          <Card title={`Entitlements: ${plan.displayName}`} subtitle="What tenants on this plan get, unless a tenant override says otherwise">
+            <ConfigEditor
+              api={api}
+              definitions={definitions.data ?? []}
+              scope={{ scope: 'plan', ref: plan.planCode }}
+              overrides={plan.overrides}
+              readOnly={!isAdmin(user)}
+              onChanged={() => void plans.reload()}
+            />
           </Card>
         </>
+      )}
+
+      {creating && (
+        <Modal
+          title="New plan"
+          icon={<Layers size={18} />}
+          onClose={() => setCreating(false)}
+          footer={
+            <>
+              <button type="button" className="btn" onClick={() => setCreating(false)}>Cancel</button>
+              <button type="submit" form="new-plan" className="btn btn-primary" disabled={action.busy}>Create plan</button>
+            </>
+          }
+        >
+          <form id="new-plan" className="form" onSubmit={(event) => savePlan(event)}>
+            <Field label="Code" hint="Lowercase letters, digits and underscores, e.g. enterprise. Cannot be changed."><input className="input mono" name="planCode" required pattern="[a-z][a-z0-9_]{1,62}" /></Field>
+            <Field label="Display name"><input className="input" name="displayName" required maxLength={120} /></Field>
+            <Field label="Available to">
+              <select className="input" name="audience" defaultValue="b2b">
+                <option value="b2b">Tenants (B2B)</option>
+                <option value="b2c">Individuals (B2C)</option>
+                <option value="both">Both</option>
+              </select>
+            </Field>
+            <label className="check"><input type="checkbox" name="isActive" defaultChecked /> Available for assignment</label>
+            {action.error && <Notice tone="error">{action.error}</Notice>}
+          </form>
+        </Modal>
       )}
     </div>
   )

@@ -217,6 +217,9 @@ export async function externalPostgresConfig(
   if (settings.sslMode === 'disable' && !policy.allowInsecureTransport) {
     throw new EndpointPolicyError('Unencrypted database connections are disabled by the platform.')
   }
+  if (settings.sslMode === 'require' && !policy.allowInsecureTransport) {
+    throw new EndpointPolicyError('Database certificate verification is required by the platform. Choose verify-full and configure a trusted CA if needed.')
+  }
   const pinned = await resolveAllowedAddress(settings.host, policy)
   const ssl =
     settings.sslMode === 'disable'

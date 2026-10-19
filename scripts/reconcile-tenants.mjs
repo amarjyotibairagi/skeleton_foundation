@@ -32,6 +32,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
 import pg from 'pg'
+import { MIN_SUPPORTED_SCHEMA_VERSION } from '../backend/tenant/dist/tenant-context.js'
 
 const rootDirectory = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 dotenv.config({ path: path.join(rootDirectory, '.env'), quiet: true })
@@ -42,7 +43,6 @@ const reapFailed = process.argv.includes('--reap-failed')
 const verifyOnly = process.argv.includes('--verify')
 const asJson = process.argv.includes('--json')
 
-const MIN_SUPPORTED_SCHEMA_VERSION = 5
 
 const databaseUrl = process.env.DATABASE_ADMIN_URL || process.env.TEST_DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_ADMIN_URL is required.')
@@ -126,7 +126,7 @@ try {
               )
           and p.rolname not in (
                 'tenant_template_owner', 'tenant_provisioner', 'tenant_provisioner_login',
-                'tenant_registry_reader_login', 'tenant_pgbouncer_admin'
+                'tenant_registry_reader_login', 'tenant_pgbouncer_admin', 'tenant_pool_login'
               )
         order by p.rolname`,
     )
@@ -262,6 +262,7 @@ try {
       'tenant_pgbouncer_admin',
       'tenant_provisioner_login',
       'tenant_registry_reader_login',
+      'tenant_pool_login',
     ])
     for (const login of poolerLogins) {
       if (infrastructureLogins.has(login) || claimedPoolerLogins.has(login)) continue
@@ -278,7 +279,7 @@ try {
       await client.query('begin')
       try {
         await client.query(
-          `update platform.tenant_domain set status = 'disabled' where tenant_id = $1`,
+          `update platform.tenant_domain set status = 'released' where tenant_id = $1`,
           [tenant.tenant_id],
         )
         // The lifecycle trigger added in migration 023 independently verifies

@@ -170,7 +170,7 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
       )
     ).rows[0] as ({ id: string } & Record<string, unknown>) | undefined
     if (!tenant) return reply.code(404).send({ success: false, message: 'Tenant not found.' })
-    const [domains, subscription, jobs, invitations, config, latest] = await Promise.all([
+    const [domains, subscription, jobs, invitations, config, latest, ownerAccount] = await Promise.all([
       pool.query(
         `select hostname, subdomain, is_primary as "isPrimary", status, created_at as "createdAt"
            from platform.tenant_domain where tenant_id = $1 order by is_primary desc, created_at`,
@@ -198,6 +198,12 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
       ),
       pool.query<{ config: ResolvedConfig }>('select platform.resolve_tenant_config($1::uuid) as config', [tenant.id]),
       latestTenantSchemaVersion(),
+      pool.query(
+        `select username, display_name as "displayName", email_normalized as email,
+                created_at as "createdAt", applied_at as "createdInTenantAt"
+           from platform.tenant_owner_bootstrap where tenant_id = $1`,
+        [tenant.id],
+      ),
     ])
     const { id: _internalId, ...publicTenant } = tenant
     return {
@@ -207,6 +213,7 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
       subscription: subscription.rows[0] ?? null,
       jobs: jobs.rows,
       ownerInvitations: invitations.rows,
+      ownerAccount: ownerAccount.rows[0] ?? null,
       effectiveConfig: config.rows[0]?.config ?? null,
     }
   })

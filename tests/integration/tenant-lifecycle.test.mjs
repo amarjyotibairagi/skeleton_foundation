@@ -181,5 +181,38 @@ describe('Integration: Tenant Lifecycle', () => {
       false,
       'PgBouncer auth file should no longer contain the removed tenant login role',
     )
+
+    // 5. The subdomain is released: the same name can be provisioned again.
+    const domainStatus = (await pool.query(
+      `select d.status from platform.tenant_domain d join platform.tenant_registry t on t.tenant_id = d.tenant_id where t.tenant_key = $1`,
+      [tenantId],
+    )).rows[0].status
+    assert.equal(domainStatus, 'released')
+    const again = await app.inject({
+      method: 'POST',
+      url: '/api/tenants',
+      headers,
+      payload: JSON.stringify({ displayName: 'Lifecycle Test Tenant Again', subdomain }),
+    })
+    const recreated = JSON.parse(again.payload)
+    assert.equal(again.statusCode, 202, recreated.message)
+    const reprovisioned = await waitForJob(app, cookie, recreated.jobId, ['succeeded', 'failed'])
+    assert.equal(reprovisioned.status, 'succeeded', reprovisioned.errorMessage || '')
+    // The hostname resolves to the new tenant, not the released row.
+    const { createServer: createTenantServer } = await import('../../backend/tenant/dist/server.js')
+    const tenantApp = await createTenantServer()
+    try {
+      const bootstrap = await tenantApp.inject({ method: 'GET', url: '/api/tenant/bootstrap', headers: { host: `${subdomain}.${process.env.TENANT_ROOT_DOMAIN || 'sandbox.test'}` } })
+      assert.equal(bootstrap.statusCode, 200)
+      assert.equal(JSON.parse(bootstrap.payload).tenant.tenantId, recreated.tenant.tenantId)
+    } finally {
+      await tenantApp.close()
+    }
+
+    // Clean up the second tenant through the same pipeline.
+    await app.inject({ method: 'POST', url: `/api/tenants/${recreated.tenant.tenantId}/suspend`, headers: actionHeaders })
+    const secondRemoval = JSON.parse((await app.inject({ method: 'POST', url: `/api/tenants/${recreated.tenant.tenantId}/deprovision`, headers: actionHeaders })).payload)
+    const secondRemoved = await waitForJob(app, cookie, secondRemoval.jobId, ['succeeded', 'failed'])
+    assert.equal(secondRemoved.status, 'succeeded', secondRemoved.errorMessage || '')
   })
 })

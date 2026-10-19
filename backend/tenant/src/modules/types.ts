@@ -16,6 +16,8 @@ export type TenantSession = {
   role: 'admin' | 'manager' | 'user' | 'guest'
   canonicalRole: CanonicalRole
   permissions: Set<string>
+  /** An administrator chose this user's password; nothing but changing it is allowed. */
+  passwordChangeRequired: boolean
 }
 
 /**

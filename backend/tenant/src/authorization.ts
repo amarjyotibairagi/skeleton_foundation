@@ -112,6 +112,6 @@ export async function assertNotDemotingLastOwner(
   )
   const remainingOwners = Number(result.rows[0]?.count || 0)
   if (remainingOwners < 1) {
-    throw new Error('Operation not allowed: tenant workspace must retain at least one active tenant_owner.')
+    throw new Error('Not allowed: this workspace must keep at least one active Owner.')
   }
 }

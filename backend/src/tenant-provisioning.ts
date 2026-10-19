@@ -29,6 +29,7 @@ export const reservedSubdomains = new Set([
 
 const subdomainPattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 const colorPattern = /^#[0-9A-Fa-f]{6}$/
+export const ownerUsernamePattern = /^[a-z0-9._-]{3,64}$/
 
 export const createTenantSchema = z.object({
   displayName: z.string().trim().min(2).max(160),
@@ -47,14 +48,23 @@ export const createTenantSchema = z.object({
   primaryColor: z.string().regex(colorPattern).default('#2563eb'),
   secondaryColor: z.string().regex(colorPattern).default('#0f172a'),
   loginMessage: z.string().trim().max(300).optional(),
-  // Optional onboarding: when present, the owner receives a single-use
-  // invitation link that becomes usable once the tenant is active.
+  // Optional onboarding. With a username and password the tenant's first
+  // administrator account is created during provisioning, ready to sign in
+  // once the tenant is active. With only an email, the owner receives a
+  // single-use invitation link instead.
   owner: z
     .object({
-      email: z.email().max(320),
       displayName: z.string().trim().min(1).max(255),
+      email: z.union([z.email().max(320), z.literal('')]).optional(),
+      username: z.string().trim().toLowerCase().regex(ownerUsernamePattern).optional(),
+      password: z.string().max(512).optional(),
+    })
+    .refine((owner) => (owner.password ? Boolean(owner.username) : Boolean(owner.email)), {
+      message: 'Provide a username and password for the administrator, or an email for an invitation.',
     })
     .optional(),
+  // Module feature keys (module.<code>) switched on for this tenant.
+  modules: z.array(z.string().regex(/^module\.[a-z][a-z0-9_]{1,62}$/)).max(32).default([]),
   planCode: z.string().trim().regex(/^[a-z][a-z0-9_]{1,62}$/).optional(),
   // Defaults to the tenancy.default_connection_tier setting (plan, then platform).
   connectionTier: z.enum(['dedicated', 'pooled']).optional(),
@@ -73,6 +83,7 @@ export const provisioningStepDefinitions = [
   ['APPLY_TENANT_SCHEMA_MIGRATIONS', 'Applying tenant structure'],
   ['APPLY_REQUIRED_SEED_DATA', 'Configuring tenant roles and permissions'],
   ['APPLY_SCHEMA_PRIVILEGES', 'Configuring tenant isolation'],
+  ['CREATE_TENANT_OWNER', 'Creating tenant administrator account'],
   ['CONFIGURE_ROLE_SEARCH_PATH', 'Configuring database defaults'],
   ['REGISTER_DATABASE_ACCESS', 'Configuring pooled database access'],
   ['REGISTER_TENANT_DOMAIN', 'Registering tenant route'],
@@ -129,9 +140,11 @@ async function transaction<T>(pool: Pool, callback: (client: PoolClient) => Prom
   }
 }
 
+export type OwnerAccountBootstrap = { username: string; displayName: string; email: string | null; passwordHash: string }
+
 export async function createTenantProvisioningJob(
   pool: Pool,
-  input: CreateTenantInput & { connectionTier: 'dedicated' | 'pooled' },
+  input: CreateTenantInput & { connectionTier: 'dedicated' | 'pooled'; ownerAccount?: OwnerAccountBootstrap | undefined },
   actorUserId: string,
   rootDomain: string,
   correlationId = randomUUID(),
@@ -185,6 +198,26 @@ export async function createTenantProvisioningJob(
           input.locale,
         ],
       )
+      // Staged before the job row exists, so the worker can never reach
+      // CREATE_TENANT_OWNER without it.
+      if (input.ownerAccount) {
+        await client.query('select platform.stage_tenant_owner_bootstrap($1, $2, $3, $4, $5, $6::uuid)', [
+          identity.tenantKey,
+          input.ownerAccount.username,
+          input.ownerAccount.displayName,
+          input.ownerAccount.email,
+          input.ownerAccount.passwordHash,
+          actorUserId,
+        ])
+      }
+      // Callers that skip schema parsing (scripts, fixtures) may omit modules.
+      for (const moduleKey of input.modules ?? []) {
+        await client.query(`select platform.set_config_value('tenant', $1, $2, 'true'::jsonb, $3::uuid)`, [
+          identity.tenantKey,
+          moduleKey,
+          actorUserId,
+        ])
+      }
       const job = await client.query<{ job_id: string }>(
         `insert into platform.tenant_provisioning_job (
            tenant_id, requested_by, correlation_id, status

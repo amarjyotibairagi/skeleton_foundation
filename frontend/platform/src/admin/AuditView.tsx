@@ -1,28 +1,20 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import type { AdminApi } from './api'
-import { Badge, Card, Notice, PageHeader, useAsyncAction } from './ui'
-
-type AuditEvent = {
-  id: string
-  timestamp: string
-  username: string | null
-  userId: string | null
-  feature: string
-  action: string
-  status: string
-  tenantKey: string | null
-  resourceType: string | null
-  resourceId: string | null
-}
+import { Filter, X } from 'lucide-react'
+import { useConsole } from '../shell/context'
+import { href } from '../shell/router'
+import type { AuditEvent } from '../shell/types'
+import { Card, Notice, PageHeader, StatusBadge, Table, useAsyncAction } from './ui'
 
 type Filters = { feature: string; action: string; status: string; tenantKey: string }
 const emptyFilters: Filters = { feature: '', action: '', status: '', tenantKey: '' }
 
-export function AuditView({ api }: { api: AdminApi }) {
+export function AuditView() {
+  const { api } = useConsole()
   const [filters, setFilters] = useState<Filters>(emptyFilters)
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [features, setFeatures] = useState<string[]>([])
   const [nextBefore, setNextBefore] = useState<string | null>(null)
+  const [formKey, setFormKey] = useState(0)
   const loader = useAsyncAction()
 
   const query = (active: Filters, before?: string) => {
@@ -39,7 +31,10 @@ export function AuditView({ api }: { api: AdminApi }) {
       setNextBefore(data.nextBefore)
       setFeatures(data.features)
     })
-  useEffect(() => { void load() }, [])
+  useEffect(() => {
+    void load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const apply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -48,39 +43,57 @@ export function AuditView({ api }: { api: AdminApi }) {
     setFilters(next)
     void load(next)
   }
+  const clear = () => {
+    setFilters(emptyFilters)
+    setFormKey((key) => key + 1)
+    void load(emptyFilters)
+  }
+  const filtered = Object.values(filters).some(Boolean)
 
   return (
-    <div className="admin-view">
-      <PageHeader eyebrow="Platform / Audit" title="Security audit trail" subtitle="Every control-plane action, append-only" onRefresh={() => void load()} busy={loader.busy} />
+    <div className="page">
+      <PageHeader title="Audit log" description="Every control-plane action, append-only. Sign-ins, configuration changes, tenant lifecycle and operator management." onRefresh={() => void load()} busy={loader.busy} />
       {loader.error && <Notice tone="error">{loader.error}</Notice>}
-      <Card>
-        <form className="admin-form admin-form-inline" onSubmit={apply}>
-          <select className="admin-input" name="feature" defaultValue=""><option value="">All areas</option>{features.map((feature) => <option key={feature}>{feature}</option>)}</select>
-          <input className="admin-input" name="action" placeholder="Action starts with…" />
-          <select className="admin-input" name="status" defaultValue=""><option value="">Any outcome</option><option>SUCCESS</option><option>FAILED</option><option>DENIED</option></select>
-          <input className="admin-input" name="tenantKey" placeholder="Tenant key (T…)" />
-          <button className="admin-button admin-button-primary">Filter</button>
+      <Card flush>
+        <form key={formKey} className="toolbar" onSubmit={apply} style={{ justifyContent: 'flex-start' }}>
+          <select className="input input-inline" name="feature" defaultValue={filters.feature} aria-label="Area">
+            <option value="">All areas</option>
+            {features.map((feature) => <option key={feature} value={feature}>{feature}</option>)}
+          </select>
+          <input className="input input-inline" name="action" defaultValue={filters.action} placeholder="Action starts with…" aria-label="Action prefix" />
+          <select className="input input-inline" name="status" defaultValue={filters.status} aria-label="Outcome" style={{ minWidth: 150 }}>
+            <option value="">Any outcome</option>
+            <option value="SUCCESS">Success</option>
+            <option value="FAILED">Failed</option>
+            <option value="DENIED">Denied</option>
+          </select>
+          <input className="input input-inline mono" name="tenantKey" defaultValue={filters.tenantKey} placeholder="Tenant key" aria-label="Tenant key" style={{ minWidth: 150 }} />
+          <button className="btn btn-primary"><Filter size={14} /> Apply</button>
+          {filtered && <button type="button" className="btn btn-ghost" onClick={clear}><X size={14} /> Clear</button>}
         </form>
-      </Card>
-      <Card>
-        <table className="admin-table">
-          <thead><tr><th>Time</th><th>Operator</th><th>Area</th><th>Action</th><th>Tenant</th><th>Resource</th><th>Outcome</th></tr></thead>
+        <Table minWidth={940}>
+          <thead><tr><th>Time (UTC)</th><th>Operator</th><th>Area</th><th>Action</th><th>Tenant</th><th>Resource</th><th>Outcome</th></tr></thead>
           <tbody>
             {events.map((event) => (
               <tr key={event.id}>
-                <td className="admin-mono">{new Date(event.timestamp).toISOString().replace('T', ' ').slice(0, 19)}</td>
-                <td>{event.username || (event.userId ? event.userId.slice(0, 8) : <span className="admin-muted">system</span>)}</td>
+                <td className="mono nowrap">{new Date(event.timestamp).toISOString().replace('T', ' ').slice(0, 19)}</td>
+                <td>{event.username || (event.userId ? <span className="mono">{event.userId.slice(0, 8)}</span> : <span className="muted">system</span>)}</td>
                 <td>{event.feature}</td>
-                <td><code>{event.action}</code></td>
-                <td>{event.tenantKey ? <code>{event.tenantKey}</code> : '—'}</td>
-                <td className="admin-hint">{event.resourceType ? `${event.resourceType}${event.resourceId ? `: ${event.resourceId}` : ''}` : '—'}</td>
-                <td><Badge tone={event.status === 'SUCCESS' ? 'good' : 'bad'}>{event.status}</Badge></td>
+                <td className="mono">{event.action}</td>
+                <td>{event.tenantKey ? <a className="mono" href={href('tenants', event.tenantKey)}>{event.tenantKey}</a> : <span className="muted">—</span>}</td>
+                <td className="muted" style={{ maxWidth: 260, overflowWrap: 'anywhere' }}>{event.resourceType ? `${event.resourceType}${event.resourceId ? `: ${event.resourceId}` : ''}` : '—'}</td>
+                <td><StatusBadge status={event.status} /></td>
               </tr>
             ))}
-            {!events.length && !loader.busy && <tr><td colSpan={7} className="admin-muted">No matching events.</td></tr>}
+            {!events.length && !loader.busy && <tr className="empty-row"><td colSpan={7}>No matching events.</td></tr>}
           </tbody>
-        </table>
-        {nextBefore && <button className="admin-button" disabled={loader.busy} onClick={() => void load(filters, nextBefore)}>Load older events</button>}
+        </Table>
+        {(nextBefore || events.length > 0) && (
+          <div className="card-foot">
+            <span>{events.length} event(s) shown</span>
+            {nextBefore && <button type="button" className="btn btn-sm" disabled={loader.busy} onClick={() => void load(filters, nextBefore)}>Load older events</button>}
+          </div>
+        )}
       </Card>
     </div>
   )

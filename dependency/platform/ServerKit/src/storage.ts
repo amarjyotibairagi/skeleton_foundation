@@ -45,7 +45,9 @@ export class LocalObjectStore implements ObjectStore {
 
   async put(key: string, body: Buffer): Promise<void> {
     const target = this.resolve(key)
-    await mkdir(path.dirname(target), { recursive: true, mode: 0o770 })
+    // The tenant service writes objects; the provisioner must also be able
+    // to remove their directories during audited tenant deprovisioning.
+    await mkdir(path.dirname(target), { recursive: true, mode: 0o2770 })
     const temporary = `${target}.${crypto.randomBytes(6).toString('hex')}.tmp`
     const handle = await open(temporary, 'wx', 0o660)
     try {

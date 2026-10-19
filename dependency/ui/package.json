@@ -5,7 +5,8 @@
   "exports": {
     "./styles.css": "./styles.css",
     "./useTurnstile": "./src/useTurnstile.ts",
-    "./MetricCard": "./src/MetricCard.tsx"
+    "./MetricCard": "./src/MetricCard.tsx",
+    "./TurnstileSlot": "./src/TurnstileSlot.tsx"
   },
   "peerDependencies": {
     "react": "^19.0.0"

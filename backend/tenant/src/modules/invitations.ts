@@ -84,7 +84,7 @@ export function createInvitationsModule(deps: { registry: Pool }): TenantModule 
         const context = kit.tenant(request)
         const parsed = parseInvitationToken(inspectBody.parse(request.body).token)
         const config = await kit.config(request)
-        const passwordMinLength = configInteger(config, 'auth.password.min_length', 12)
+        const passwordMinLength = configInteger(config, 'auth.password.min_length', 8)
         if (parsed?.kind === 'owner') {
           const row = (
             await deps.registry.query<{ email_normalized: string; display_name: string; expires_at: Date }>(
@@ -142,7 +142,7 @@ export function createInvitationsModule(deps: { registry: Pool }): TenantModule 
         const parsed = parseInvitationToken(body.token)
         if (!parsed || parsed.kind === 'operator') return reply.code(404).send({ success: false, message: invalidInvitation })
         const config = await kit.config(request)
-        const minimum = configInteger(config, 'auth.password.min_length', 12)
+        const minimum = configInteger(config, 'auth.password.min_length', 8)
         if (body.password.length < minimum) {
           return reply.code(400).send({ success: false, message: `Password must be at least ${minimum} characters.` })
         }

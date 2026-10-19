@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import { ShieldCheck } from 'lucide-react'
 
 type Invitation = { username: string; displayName: string; role: string; expiresAt: string; passwordMinLength: number }
 
@@ -58,34 +59,42 @@ export default function AcceptInvite() {
   }
 
   return (
-    <main className="admin-accept">
-      <div className="dynamic-card admin-accept-card">
-        <h1 className="admin-title">Set up your operator account</h1>
-        {invitation && !done && (
-          <p className="admin-hint">
-            Signing in as <strong>{invitation.username}</strong> ({invitation.role.replace('platform_', '')}). This link expires {new Date(invitation.expiresAt).toLocaleString()}.
-          </p>
-        )}
-        {error && <div className="admin-notice admin-notice-error" role="alert">{error}</div>}
-        {done ? (
-          <>
-            <div className="admin-notice admin-notice-success">{done}</div>
-            <a className="admin-button admin-button-primary" href="/">Go to sign in</a>
-          </>
-        ) : invitation ? (
-          <form className="admin-form" onSubmit={(event) => void submit(event)}>
-            <label className="admin-field">
-              <span className="admin-field-label">New password</span>
-              <input className="admin-input" name="password" type="password" autoComplete="new-password" minLength={invitation.passwordMinLength} required />
-              <span className="admin-hint">At least {invitation.passwordMinLength} characters. A passphrase works well.</span>
-            </label>
-            <label className="admin-field">
-              <span className="admin-field-label">Confirm password</span>
-              <input className="admin-input" name="confirm" type="password" autoComplete="new-password" required />
-            </label>
-            <button className="admin-button admin-button-primary" disabled={busy}>{busy ? 'Saving…' : 'Set password'}</button>
-          </form>
-        ) : null}
+    <main className="login-page-bg">
+      <div className="login-shell">
+        <div className="login-brand">
+          <span className="brand-mark"><ShieldCheck size={18} /></span>
+          <span>Platform console</span>
+        </div>
+        <div className="login-card">
+          <div>
+            <h1>Set up your operator account</h1>
+            <p className="login-sub">
+              {invitation && !done
+                ? <>Signing in as <strong>{invitation.username}</strong> ({invitation.role.replace('platform_', '')}). This link expires {new Date(invitation.expiresAt).toLocaleString()}.</>
+                : 'Choose the password you will sign in with.'}
+            </p>
+          </div>
+          {error && <div className="login-error" role="alert">{error}</div>}
+          {done ? (
+            <>
+              <p style={{ fontSize: 13.5, color: '#15803d' }}>{done}</p>
+              <a className="login-submit" href="/" style={{ textDecoration: 'none' }}>Go to sign in</a>
+            </>
+          ) : invitation ? (
+            <form onSubmit={(event) => void submit(event)} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="login-field">
+                <label htmlFor="invite-password">New password</label>
+                <input id="invite-password" className="login-input" style={{ paddingLeft: 12 }} name="password" type="password" autoComplete="new-password" minLength={invitation.passwordMinLength} required />
+                <span style={{ fontSize: 12, color: '#5b6779' }}>At least {invitation.passwordMinLength} characters. A passphrase works well.</span>
+              </div>
+              <div className="login-field">
+                <label htmlFor="invite-confirm">Confirm password</label>
+                <input id="invite-confirm" className="login-input" style={{ paddingLeft: 12 }} name="confirm" type="password" autoComplete="new-password" required />
+              </div>
+              <button className="login-submit" disabled={busy}>{busy ? 'Saving…' : 'Set password'}</button>
+            </form>
+          ) : null}
+        </div>
       </div>
     </main>
   )

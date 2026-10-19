@@ -80,6 +80,7 @@ let exitCode = 0
 try {
   // Serialise concurrent runners (deploys, the restore drill, CI) so two
   // processes cannot interleave migrations against the same cluster.
+  await client.query('select pg_advisory_lock_shared(hashtext($1))', ['skeleton-local-storage-backup'])
   await client.query('select pg_advisory_lock(hashtext($1))', ['platform-migrations'])
 
   if (apply) {
@@ -256,5 +257,6 @@ try {
   }
 } finally {
   await client.query('select pg_advisory_unlock(hashtext($1))', ['platform-migrations']).catch(() => undefined)
+  await client.query('select pg_advisory_unlock_shared(hashtext($1))', ['skeleton-local-storage-backup']).catch(() => undefined)
   await client.end()
 }

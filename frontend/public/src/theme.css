@@ -86,59 +86,11 @@
   box-sizing: border-box;
 }
 
-.turnstile-grid-wrapper {
-  display: grid;
-  grid-template-rows: 1fr;
-  opacity: 1;
-  transform: translateY(0) scale(1);
-  margin-top: 6px;
-  margin-bottom: 6px;
-  transition: 
-    grid-template-rows 0.75s cubic-bezier(0.16, 1, 0.3, 1),
-    opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1),
-    transform 0.6s cubic-bezier(0.16, 1, 0.3, 1),
-    margin 0.75s cubic-bezier(0.16, 1, 0.3, 1);
-}
 
-.turnstile-grid-wrapper.collapsed {
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transform: translateY(-8px) scale(0.96);
-  margin-top: 0px;
-  margin-bottom: 0px;
-  pointer-events: none;
-}
 
-.turnstile-grid-inner {
-  min-height: 0;
-  overflow: hidden;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-}
 
-.verified-badge-wrapper {
-  display: grid;
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transform: translateY(6px);
-  transition: 
-    grid-template-rows 0.6s cubic-bezier(0.16, 1, 0.3, 1),
-    opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1),
-    transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-}
 
-.verified-badge-wrapper.visible {
-  grid-template-rows: 1fr;
-  opacity: 1;
-  transform: translateY(0);
-  margin-bottom: 4px;
-}
 
-.verified-badge-inner {
-  min-height: 0;
-  overflow: hidden;
-}
 
 .submit-btn {
   height: 50px;

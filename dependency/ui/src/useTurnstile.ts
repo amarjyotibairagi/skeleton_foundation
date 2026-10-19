@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 declare global {
   interface Window {
@@ -22,89 +22,101 @@ declare global {
 }
 
 export const PRODUCTION_TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY as string | undefined
+
 /**
  * Set at build time (VITE_LOGIN_CHALLENGE=none) only for deployments that run
  * without Cloudflare Turnstile. The servers must be configured the same way
- * (LOGIN_CHALLENGE=none) or they reject the placeholder token.
+ * (LOGIN_CHALLENGE=none) or they reject the placeholder token. Login screens
+ * hide <TurnstileSlot> when this is set.
  */
 export const LOGIN_CHALLENGE_DISABLED = import.meta.env.VITE_LOGIN_CHALLENGE === 'none'
 export const DISABLED_CHALLENGE_TOKEN = 'login-challenge-disabled-by-configuration'
 
+/** Widget dimensions Cloudflare renders for each size; the slot reserves exactly this box. */
+export type TurnstileWidgetSize = 'flexible' | 'compact'
+export const TURNSTILE_BOX: Record<TurnstileWidgetSize, { width: number | '100%'; height: number }> = {
+  flexible: { width: '100%', height: 65 },
+  compact: { width: 150, height: 140 },
+}
+// A flexible widget is never narrower than this; below it, compact fits.
+const FLEXIBLE_MIN_WIDTH = 300
+
 /**
- * Renders and manages a Cloudflare Turnstile widget's lifecycle: polls for
- * the script to be ready, renders once, tracks verified/collapsed/badge
- * state through the same timed reveal sequence, and exposes a reset for
- * post-submit re-arming. `enabled` should be false while a session check is
- * still pending or a user is already signed in, matching how each login
- * screen only needs the widget while its own login gate is showing.
+ * Renders and manages a Cloudflare Turnstile widget for a login screen.
+ *
+ * The widget is rendered once with action "login" (every BFF verifies that
+ * binding) into a slot whose size is chosen before first paint and never
+ * changes afterwards: the widget is not collapsed after success, it keeps
+ * showing Cloudflare's own success state. Use it with <TurnstileSlot>.
+ *
+ * `enabled` should be false while a session check is still pending or a user
+ * is already signed in; the widget is removed when it turns false, so it
+ * renders again after a sign-out.
  */
 export function useTurnstile({ enabled, onError }: { enabled: boolean; onError: (message: string | null) => void }) {
   const [isVerified, setIsVerified] = useState(false)
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null)
-  const [isCollapsed, setIsCollapsed] = useState(false)
-  const [isBadgeVisible, setIsBadgeVisible] = useState(false)
+  const [size, setSize] = useState<TurnstileWidgetSize | null>(null)
   const turnstileContainerRef = useRef<HTMLDivElement>(null)
   const widgetIdRef = useRef<string | null>(null)
+  const sizeRef = useRef<TurnstileWidgetSize | null>(null)
+
+  /** Called by the slot before first paint with its width; the first call wins. */
+  const lockSize = useCallback((slotWidth: number) => {
+    if (sizeRef.current) return
+    sizeRef.current = slotWidth >= FLEXIBLE_MIN_WIDTH ? 'flexible' : 'compact'
+    setSize(sizeRef.current)
+  }, [])
 
   useEffect(() => {
     if (!enabled) return
 
     let interval: number | undefined
-    let collapseTimer: ReturnType<typeof setTimeout> | undefined
-    let badgeTimer: ReturnType<typeof setTimeout> | undefined
+
+    const clearVerification = () => {
+      setIsVerified(false)
+      setTurnstileToken(null)
+    }
 
     const initTurnstile = () => {
       if (LOGIN_CHALLENGE_DISABLED) {
+        if (interval) clearInterval(interval)
         setIsVerified(true)
         setTurnstileToken(DISABLED_CHALLENGE_TOKEN)
-        if (interval) clearInterval(interval)
         return
       }
-      if (window.turnstile && turnstileContainerRef.current && !widgetIdRef.current && PRODUCTION_TURNSTILE_SITE_KEY) {
-        try {
-          widgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
-            sitekey: PRODUCTION_TURNSTILE_SITE_KEY,
-            action: 'login',
-            theme: 'light',
-            size: 'flexible',
-            callback: (token: string) => {
-              setIsVerified(true)
-              setTurnstileToken(token)
-              onError(null)
-              collapseTimer = setTimeout(() => {
-                setIsCollapsed(true)
-                badgeTimer = setTimeout(() => {
-                  setIsBadgeVisible(true)
-                }, 600)
-              }, 400)
-            },
-            'error-callback': () => {
-              setIsVerified(false)
-              setTurnstileToken(null)
-              setIsCollapsed(false)
-              setIsBadgeVisible(false)
-              onError('Verification failed. Please retry.')
-            },
-            'expired-callback': () => {
-              setIsVerified(false)
-              setTurnstileToken(null)
-              setIsCollapsed(false)
-              setIsBadgeVisible(false)
-            },
-          })
-          if (interval) clearInterval(interval)
-        } catch {
-          setIsVerified(false)
-          setTurnstileToken(null)
-          setIsCollapsed(false)
-          setIsBadgeVisible(false)
-          onError('Security verification could not be initialized.')
+      if (!PRODUCTION_TURNSTILE_SITE_KEY) {
+        if (interval) clearInterval(interval)
+        if (import.meta.env.DEV) {
+          setIsVerified(true)
+          setTurnstileToken('dev-token')
+        } else {
+          onError('Security verification is not configured.')
         }
-      } else if (!PRODUCTION_TURNSTILE_SITE_KEY && import.meta.env.DEV) {
-        setIsVerified(true)
-        setTurnstileToken('dev-token')
-      } else if (!PRODUCTION_TURNSTILE_SITE_KEY) {
-        onError('Security verification is not configured.')
+        return
+      }
+      if (!window.turnstile || !turnstileContainerRef.current || !sizeRef.current || widgetIdRef.current) return
+      try {
+        widgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
+          sitekey: PRODUCTION_TURNSTILE_SITE_KEY,
+          action: 'login',
+          theme: 'light',
+          size: sizeRef.current,
+          callback: (token: string) => {
+            setIsVerified(true)
+            setTurnstileToken(token)
+            onError(null)
+          },
+          'error-callback': () => {
+            clearVerification()
+            onError('Verification failed. Please retry.')
+          },
+          'expired-callback': clearVerification,
+        })
+        if (interval) clearInterval(interval)
+      } catch {
+        clearVerification()
+        onError('Security verification could not be initialized.')
       }
     }
 
@@ -113,8 +125,15 @@ export function useTurnstile({ enabled, onError }: { enabled: boolean; onError: 
 
     return () => {
       if (interval) clearInterval(interval)
-      if (collapseTimer) clearTimeout(collapseTimer)
-      if (badgeTimer) clearTimeout(badgeTimer)
+      if (widgetIdRef.current && window.turnstile) {
+        try {
+          window.turnstile.remove(widgetIdRef.current)
+        } catch {
+          // The script may already be gone during navigation.
+        }
+      }
+      widgetIdRef.current = null
+      clearVerification()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled])
@@ -123,8 +142,6 @@ export function useTurnstile({ enabled, onError }: { enabled: boolean; onError: 
     if (LOGIN_CHALLENGE_DISABLED) return
     setIsVerified(false)
     setTurnstileToken(null)
-    setIsCollapsed(false)
-    setIsBadgeVisible(false)
     if (window.turnstile && widgetIdRef.current) {
       try {
         window.turnstile.reset(widgetIdRef.current)
@@ -134,5 +151,7 @@ export function useTurnstile({ enabled, onError }: { enabled: boolean; onError: 
     }
   }
 
-  return { isVerified, turnstileToken, isCollapsed, isBadgeVisible, turnstileContainerRef, resetTurnstile }
+  return { isVerified, turnstileToken, size, lockSize, turnstileContainerRef, resetTurnstile }
 }
+
+export type TurnstileController = ReturnType<typeof useTurnstile>
